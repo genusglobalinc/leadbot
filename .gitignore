@@ -1,7 +1,15 @@
-# Sensitive Configuration Files
+# Sensitive Configuration Files (API keys, credentials, workflows)
 configs/
-*.json
+configs/**/*.json
+llm_config.json
+last_session.json
+*_workflow.json
+*_verified_partial.json
+
+# Keep requirements.txt visible
 !requirements.txt
+!package.json
+!tsconfig.json
 
 # CSV Files (may contain sensitive lead data)
 *.csv
