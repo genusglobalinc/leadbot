@@ -1,4 +1,7 @@
 selenium
 beautifulsoup4
 pandas
-PySimpleGUI
+webdriver-manager
+requests
+openai
+tavily-python
