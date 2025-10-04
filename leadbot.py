@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 import pandas as pd
@@ -57,13 +58,36 @@ def load_llm_config():
     }
 
 def save_llm_config(config):
-    """Save LLM configuration."""
+    """Save LLM configuration to configs/llm_config.json."""
     try:
+        config_path = os.path.join('configs', 'llm_config.json')
         os.makedirs('configs', exist_ok=True)
-        with open(LLM_CONFIG_FILE, 'w') as f:
+        with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
     except Exception as e:
         print(f"Error saving LLM config: {e}")
+
+def load_processing_status(site_name):
+    """Load processing status for CSV rows."""
+    try:
+        status_path = os.path.join('configs', f'{site_name}_processing_status.json')
+        if os.path.exists(status_path):
+            with open(status_path, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        print(f"Error loading processing status: {e}")
+        return {}
+
+def save_processing_status(site_name, status):
+    """Save processing status for CSV rows."""
+    try:
+        status_path = os.path.join('configs', f'{site_name}_processing_status.json')
+        os.makedirs('configs', exist_ok=True)
+        with open(status_path, 'w') as f:
+            json.dump(status, f, indent=2)
+    except Exception as e:
+        print(f"Error saving processing status: {e}")
 
 def perform_web_research(query, search_api_key):
     """
@@ -120,61 +144,144 @@ def infer_field_value_with_llm(field_context, csv_row_data, available_options=No
         field_type = field_context.get('type', 'text')
         field_tag = field_context.get('tag', 'input')
         
+        # SPECIAL CASE: Employee count fields - just return 1 if blank
+        field_lower = field_id.lower()
+        csv_value = csv_row_data.get(field_id, '')
+        is_blank = pd.isna(csv_value) or not str(csv_value).strip()
+        
+        if is_blank and ('employee' in field_lower or 'staff' in field_lower or 'workforce' in field_lower):
+            return '1'
+        
         # Perform web research if enabled
         research_results = None
         if config.get('enable_search') and config.get('search_api_key'):
             # Build search query from CSV data
             search_terms = []
-            for col, val in csv_row_data.items():
-                if val and str(val).strip() and col.lower() in ['name', 'company', 'business', 'organization']:
-                    search_terms.append(str(val))
+            company_name = None
             
-            if search_terms:
-                # Add field context to search
-                if field_id and field_id != 'unknown':
-                    search_query = f"{' '.join(search_terms)} {field_id}"
+            # Extract company/business name from CSV
+            for col, val in csv_row_data.items():
+                if val and str(val).strip():
+                    col_lower = col.lower()
+                    if col_lower in ['name', 'company', 'company name', 'business', 'business name', 'organization']:
+                        company_name = str(val)
+                        search_terms.append(company_name)
+                        break
+            
+            # Determine if we need to research this field
+            should_research = False
+            field_lower = field_id.lower()
+            
+            # Check if current field's CSV data is blank/missing
+            csv_value = csv_row_data.get(field_id, '')
+            is_blank = pd.isna(csv_value) or not str(csv_value).strip()
+            
+            # CRITICAL: Only research for specific field types when blank
+            # DO NOT research for email, username, password, employee count, etc.
+            researchable_fields = ['revenue', 'income', 'industry', 'sector']
+            
+            if is_blank and company_name:
+                # Check if this field type should be researched
+                for keyword in researchable_fields:
+                    if keyword in field_lower:
+                        should_research = True
+                        break
+            
+            if should_research and company_name:
+                # Build targeted search query based on field type
+                if 'employee' in field_lower or 'staff' in field_lower or 'workforce' in field_lower:
+                    search_query = f"{company_name} number of employees company size"
+                elif 'revenue' in field_lower or 'income' in field_lower:
+                    search_query = f"{company_name} annual revenue company financials"
+                elif 'industry' in field_lower or 'sector' in field_lower:
+                    search_query = f"{company_name} industry sector business type"
                 else:
-                    search_query = ' '.join(search_terms)
+                    search_query = f"{company_name} {field_id.replace('_', ' ')}"
                 
                 print(f"    Researching: {search_query}")
                 research_results = perform_web_research(search_query, config['search_api_key'])
         
-        prompt = f"""You are a form-filling assistant. Based on the provided business data and any research results, suggest the most appropriate value for the form field.
+        # Build detailed context
+        context = f"""CONTEXT: You are filling out a web form with lead/business data. This is part of an automated workflow that processes CSV data row-by-row.
 
-Form Field:
+FORM FIELD BEING FILLED:
 - Field ID: {field_id}
 - Field Type: {field_type}
 - Field Tag: {field_tag}
+- Purpose: This field expects data related to '{field_id}'
 
-Business Data:
+RULES:
+1. For STATE fields: ALWAYS use 2-letter abbreviations (e.g., CO not Colorado, NY not New York)
+2. For blank/empty CSV values WITHOUT research: Return nothing (leave completely blank)
+3. For employee count WITH research: Extract and return ONLY a number between 1-30
+4. Match the format expected by the field type
+5. Use exact data from CSV when available
+6. When returning empty values: Output absolutely nothing, not the word 'empty' or 'blank' or 'none'
+
+BUSINESS DATA FROM CSV:
 """
         for col, val in csv_row_data.items():
-            prompt += f"- {col}: {val}\n"
+            if pd.isna(val) or val == '':
+                context += f"- {col}: [BLANK - needs research]\n"
+            else:
+                context += f"- {col}: {val}\n"
         
         if research_results:
-            prompt += f"\n=== Web Research Results ===\n{research_results}\n\n"
+            context += f"\n=== WEB RESEARCH RESULTS ===\n{research_results}\n"
+            context += "\nIMPORTANT: The field's CSV data is BLANK. Extract the answer from the web research above.\n"
         
         if available_options:
-            prompt += f"\nAvailable Options (select one):\n"
+            context += f"\n=== AVAILABLE DROPDOWN OPTIONS ===\n"
             for opt in available_options:
-                prompt += f"- {opt}\n"
-            prompt += "\nRespond with ONLY the exact option text that best matches the business data and research."
+                context += f"- {opt}\n"
+            context += "\nTASK: Select the EXACT option text that best matches. Consider state abbreviations if this is a state field."
         else:
-            prompt += "\nRespond with ONLY the value to enter (no explanation). Be concise and accurate."
+            context += "\nTASK: Return ONLY the value to enter. No explanation, no quotes, just the raw value."
         
         # Call OpenAI API
         client = OpenAI(api_key=config['api_key'], base_url=config.get('base_url'))
+        
+        system_prompt = """You are a form-filling assistant for automated lead processing workflows.
+
+KEY RULES:
+- For US states: ALWAYS use 2-letter codes (CO, NY, CA, etc.) never full names
+- Match exact format of dropdown options when provided
+- When CSV data is BLANK and NO research: Return absolutely nothing (blank output)
+- For employee count WITH research: Return ONLY a number between 1-30 (e.g., "15" or "8")
+- For revenue: Extract from "$5M revenue" (return just number like "5000000")
+- Be precise and concise - return only the value, nothing else
+- NEVER output words like "empty", "blank", "none", "null" - just leave it empty
+- Consider the field ID/name to understand what data is expected"""
+        
         response = client.chat.completions.create(
             model=config.get('model', 'gpt-4o-mini'),
             messages=[
-                {"role": "system", "content": "You are a helpful form-filling assistant with access to web research. Respond with only the requested value based on the data and research provided, no explanations."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": context}
             ],
-            temperature=0.3,
-            max_tokens=100
+            temperature=0.2,
+            max_tokens=150
         )
         
         suggested_value = response.choices[0].message.content.strip()
+        
+        # Post-process: Clean up common LLM mistakes
+        if suggested_value.lower() in ['empty string', 'empty', 'blank', 'none', 'null', 'n/a', 'not available']:
+            return ''
+        
+        # For employee count fields: Extract just the number
+        if 'employee' in field_id.lower() or 'staff' in field_id.lower():
+            # Extract first number found
+            import re
+            numbers = re.findall(r'\d+', suggested_value)
+            if numbers:
+                num = int(numbers[0])
+                # Clamp to 1-30 range
+                suggested_value = str(min(max(num, 1), 30))
+        
+        # Remove quotes if LLM added them
+        suggested_value = suggested_value.strip('"\'\'"')
+        
         return suggested_value
     
     except Exception as e:
@@ -718,15 +825,7 @@ class WorkflowEditorDialog:
         # Title
         ttk.Label(self.window, text="Edit Workflow Settings", font=('Arial', 14, 'bold')).pack(pady=10)
         
-        # Loop start point
-        loop_frame = ttk.LabelFrame(self.window, text="Loop Settings", padding=10)
-        loop_frame.pack(fill='x', padx=10, pady=5)
-        
-        ttk.Label(loop_frame, text="Start from step (for 2nd+ iterations):").pack(side='left', padx=5)
-        self.loop_start_var = tk.IntVar(value=config.get('loop_start_step', 0))
-        loop_spin = ttk.Spinbox(loop_frame, from_=0, to=len(config.get('actions', [])), textvariable=self.loop_start_var, width=10)
-        loop_spin.pack(side='left', padx=5)
-        ttk.Label(loop_frame, text="(0 = start from beginning every time)", foreground='gray').pack(side='left', padx=5)
+        # Loop configuration removed - always runs full workflow for each row
         
         # CSV Mappings
         mapping_frame = ttk.LabelFrame(self.window, text="CSV Column Mappings", padding=10)
@@ -752,9 +851,14 @@ class WorkflowEditorDialog:
         ttk.Label(header_frame, text="Action", width=15, font=('Arial', 10, 'bold')).grid(row=0, column=1, padx=5)
         ttk.Label(header_frame, text="Field/Name", width=30, font=('Arial', 10, 'bold')).grid(row=0, column=2, padx=5)
         ttk.Label(header_frame, text="CSV Column", width=25, font=('Arial', 10, 'bold')).grid(row=0, column=3, padx=5)
+        ttk.Label(header_frame, text="Start 2nd+ Rows", width=12, font=('Arial', 10, 'bold')).grid(row=0, column=4, padx=5)
+        ttk.Label(header_frame, text="Delete", width=8, font=('Arial', 10, 'bold')).grid(row=0, column=5, padx=5)
         
-        # Store comboboxes
+        # Store comboboxes and deletion tracking
         self.mapping_combos = {}
+        self.deleted_indices = set()
+        self.step_frames = {}
+        self.loop_start_var = tk.IntVar(value=config.get('loop_start_step', 0))
         
         # Create row for each action
         actions = config.get('actions', [])
@@ -767,6 +871,10 @@ class WorkflowEditorDialog:
             
             row_frame = ttk.Frame(scrollable_frame, relief='solid', borderwidth=1)
             row_frame.pack(fill='x', padx=5, pady=2)
+            
+            # Store frame reference
+            step_idx = i - 1  # 0-based index
+            self.step_frames[step_idx] = row_frame
             
             # Step number
             ttk.Label(row_frame, text=f"{i}", width=6).grid(row=0, column=0, padx=5, pady=5)
@@ -802,6 +910,14 @@ class WorkflowEditorDialog:
                 self.mapping_combos[selector] = combo
             else:
                 ttk.Label(row_frame, text="(not mappable)", foreground='gray', width=23).grid(row=0, column=3, padx=5, pady=5)
+            
+            # Loop start radio button
+            radio = ttk.Radiobutton(row_frame, variable=self.loop_start_var, value=step_idx)
+            radio.grid(row=0, column=4, padx=5, pady=5)
+            
+            # Delete button
+            delete_btn = ttk.Button(row_frame, text="✗ Delete", width=8, command=lambda idx=step_idx: self.delete_step(idx))
+            delete_btn.grid(row=0, column=5, padx=5, pady=5)
         
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -814,11 +930,18 @@ class WorkflowEditorDialog:
         
         self.window.transient(parent)
         self.window.grab_set()
-        self.window.wait_window()
+        self.result_config = None
+    
+    def delete_step(self, step_idx):
+        """Mark a step for deletion and hide it from UI."""
+        self.deleted_indices.add(step_idx)
+        if step_idx in self.step_frames:
+            self.step_frames[step_idx].pack_forget()
+        if self.main_log:
+            self.main_log(f"[EDIT] Marked step {step_idx + 1} for deletion")
     
     def save_changes(self):
-        """Save updated config."""
-        # Update CSV mapping
+        """Save changes to config."""
         new_mapping = {}
         for selector, combo in self.mapping_combos.items():
             value = combo.get()
@@ -827,15 +950,24 @@ class WorkflowEditorDialog:
             elif value != '(skip)':
                 new_mapping[selector] = value
         
+        # Filter out deleted steps
+        original_actions = self.config.get('actions', [])
+        filtered_actions = [action for idx, action in enumerate(original_actions) if idx not in self.deleted_indices]
+        
         # Update config
         self.config['csv_mapping'] = new_mapping
+        self.config['actions'] = filtered_actions
         self.config['loop_start_step'] = self.loop_start_var.get()
         
         self.result_config = self.config
         
         if self.main_log:
             self.main_log(f"[EDIT] Updated CSV mappings: {len(new_mapping)} fields mapped")
-            self.main_log(f"[EDIT] Loop start step: {self.loop_start_var.get()}")
+            if self.deleted_indices:
+                self.main_log(f"[EDIT] Deleted {len(self.deleted_indices)} steps: {sorted([i+1 for i in self.deleted_indices])}")
+            loop_start = self.loop_start_var.get()
+            if loop_start > 0:
+                self.main_log(f"[EDIT] 2nd+ row iterations will start from step {loop_start + 1}")
         
         self.window.destroy()
     
@@ -935,6 +1067,8 @@ class VerificationDialog:
         element_frame = ttk.Frame(self.info_frame)
         element_frame.pack(fill='x', pady=5)
         ttk.Button(element_frame, text="🎯 Override Element (Click on Page)", command=self.override_element).pack(side='left', padx=5)
+        ttk.Button(element_frame, text="🔍 Find Dropdown", command=self.find_dropdown).pack(side='left', padx=5)
+        ttk.Button(element_frame, text="⚙ Change to CLICK", command=self.convert_to_click).pack(side='left', padx=5)
         self.element_status = ttk.Label(element_frame, text="", foreground='blue')
         self.element_status.pack(side='left', padx=5)
         
@@ -950,6 +1084,12 @@ class VerificationDialog:
         
         self.btn_delete = ttk.Button(btn_frame, text="✗ Delete Step", command=self.delete_step)
         self.btn_delete.pack(side='left', padx=5)
+        
+        self.btn_insert = ttk.Button(btn_frame, text="➕ Insert Step After", command=self.insert_step)
+        self.btn_insert.pack(side='left', padx=5)
+        
+        self.btn_keyboard = ttk.Button(btn_frame, text="⌨ Add Keyboard Action", command=self.add_keyboard_action)
+        self.btn_keyboard.pack(side='left', padx=5)
         
         self.btn_restore = ttk.Button(btn_frame, text="↺ Restore Deleted", command=self.restore_deleted)
         self.btn_restore.pack(side='left', padx=5)
@@ -1031,9 +1171,12 @@ class VerificationDialog:
         # IMMEDIATELY preview/highlight the element BEFORE user approval
         self.preview_element(action)
         
-        # Describe action
+        # Describe action with step name prominently displayed
+        step_name_display = f"'{existing_name}'" if existing_name else "(no name)"
+        
         if action_type == 'click':
-            self.action_label.config(text=f"Action: Click element\nSelector: {action.get('selector', 'N/A')[:80]}")
+            action_text = f"Action: Click element\nName: {step_name_display}\nSelector: {action.get('selector', 'N/A')[:60]}"
+            self.action_label.config(text=action_text)
             self.data_label.config(text="")
             self.value_label.config(text="")
             self.reasoning_text.config(state='normal')
@@ -1041,7 +1184,44 @@ class VerificationDialog:
             self.reasoning_text.config(state='disabled')
             self.override_var.set("")
         elif action_type == 'navigate':
-            self.action_label.config(text=f"Action: Navigate to\nURL: {action.get('url', 'N/A')}")
+            action_text = f"Action: Navigate to\nName: {step_name_display}\nURL: {action.get('url', 'N/A')}"
+            self.action_label.config(text=action_text)
+            self.data_label.config(text="")
+            self.value_label.config(text="")
+            self.reasoning_text.config(state='normal')
+            self.reasoning_text.delete('1.0', 'end')
+            self.reasoning_text.config(state='disabled')
+            self.override_var.set("")
+        elif action_type == 'interactive_sequence':
+            # Show interactive sequence details
+            actions_list = action.get('actions', [])
+            keyboard_count = sum(1 for a in actions_list if isinstance(a, dict) and a.get('type') == 'keyboard')
+            click_count = sum(1 for a in actions_list if isinstance(a, dict) and a.get('type') == 'click')
+            
+            action_text = f"Action: INTERACTIVE SEQUENCE\nName: {step_name_display}\nActions: {keyboard_count} keys + {click_count} clicks"
+            self.action_label.config(text=action_text)
+            self.data_label.config(text="")
+            self.value_label.config(text="")
+            
+            # Show sequence details in reasoning box
+            self.reasoning_text.config(state='normal')
+            self.reasoning_text.delete('1.0', 'end')
+            self.reasoning_text.insert('1.0', "Recorded sequence:\n")
+            for i, act in enumerate(actions_list[:20], 1):  # Show first 20
+                if isinstance(act, dict):
+                    if act.get('type') == 'keyboard':
+                        self.reasoning_text.insert('end', f"{i}. Key: {act.get('key')}\n")
+                    elif act.get('type') == 'click':
+                        self.reasoning_text.insert('end', f"{i}. Click: {act.get('selector', 'N/A')[:30]}\n")
+            if len(actions_list) > 20:
+                self.reasoning_text.insert('end', f"... and {len(actions_list) - 20} more actions\n")
+            self.reasoning_text.config(state='disabled')
+            self.override_var.set("")
+        elif action_type == 'keyboard':
+            key = action.get('key', 'UNKNOWN')
+            repeat = action.get('repeat', 1)
+            action_text = f"Action: KEYBOARD\nName: {step_name_display}\nKey: {key}\nRepeat: {repeat}x"
+            self.action_label.config(text=action_text)
             self.data_label.config(text="")
             self.value_label.config(text="")
             self.reasoning_text.config(state='normal')
@@ -1053,7 +1233,8 @@ class VerificationDialog:
             field_context = action.get('field_context', {})
             field_id = field_context.get('id', 'unknown')
             
-            self.action_label.config(text=f"Action: {action_type.upper()}\nField ID: {field_id}\nSelector: {selector[:80]}")
+            action_text = f"Action: {action_type.upper()}\nName: {step_name_display}\nField ID: {field_id}\nSelector: {selector[:50]}"
+            self.action_label.config(text=action_text)
             
             # Determine value and source
             csv_col = self.config['csv_mapping'].get(selector)
@@ -1150,7 +1331,12 @@ class VerificationDialog:
             value = str(action.get('value', ''))
             source = "Recorded Value (from your demo)"
         elif csv_col and csv_col in self.test_row:
-            value = str(self.test_row[csv_col])
+            # Handle blank/NaN values properly
+            raw_value = self.test_row[csv_col]
+            if pd.isna(raw_value):
+                value = ''
+            else:
+                value = str(raw_value)
             source = f"CSV Column: {csv_col}"
         else:
             # Would use LLM - simulate it
@@ -1245,7 +1431,7 @@ class VerificationDialog:
             else:
                 self.log(f"Step {self.current_step + 1}: Approved {action_type}")
             
-            # Execute the action
+            # Execute the action (keyboard, click, navigate, input, select)
             self.execute_action(action)
             
             # Save verified action with corrected value and name
@@ -1324,30 +1510,30 @@ class VerificationDialog:
             
             self.current_step -= 1
             self.show_step()
-            self.log("Moved to previous step. Re-verify or make changes.")
-        else:
-            self.log("Already at first step.")
     
     def delete_step(self):
-        """Delete current step from workflow (soft delete - can be restored)."""
-        action = self.config['actions'][self.current_step].copy()
-        action_desc = f"{action.get('action', 'unknown')} - {action.get('selector', 'N/A')[:50]}"
+        """Delete the current step from workflow."""
+        if not self.config or not self.config.get('actions'):
+            messagebox.showinfo("No Steps", "No workflow steps to delete.")
+            return
         
-        # Save step name before deleting
-        step_name = self.step_name_var.get().strip()
-        if step_name:
-            action['step_name'] = step_name
+        # Check bounds
+        if self.current_step >= len(self.config['actions']):
+            messagebox.showinfo("No Step", "No step at current position to delete.")
+            return
         
-        response = messagebox.askyesno(
-            "Delete Step",
-            "Delete this step?\n\n"
-            "Step will be moved to deleted list and can be restored.\n"
-            "Permanent deletion only available after full verification."
-        )
+        action = self.config['actions'][self.current_step]
+        action_type = action.get('action', 'unknown')
+        action_desc = f"{action_type.upper()} step"
+        
+        response = messagebox.askyesno("Delete Step", f"Delete {action_desc} at position {self.current_step + 1}?")
+        
         if response:
-            # Add to deleted steps list with position info
-            action['original_position'] = self.current_step
-            self.deleted_steps.append(action)
+            # Store in deleted list for restore
+            self.deleted_steps.append({
+                'step': action,
+                'position': self.current_step
+            })
             
             # Remove from actions list
             del self.config['actions'][self.current_step]
@@ -1358,6 +1544,290 @@ class VerificationDialog:
             
             # Show next step (or complete if that was the last one)
             self.show_step()
+    
+    def add_keyboard_action(self):
+        """Record live keyboard actions from the browser."""
+        keyboard_win = tk.Toplevel(self.window)
+        keyboard_win.title("Record Keyboard Actions")
+        keyboard_win.geometry("600x400")
+        
+        ttk.Label(keyboard_win, text="🎹 Record Keyboard Actions", font=('Arial', 14, 'bold')).pack(pady=10)
+        
+        info_label = ttk.Label(keyboard_win, text="Click 'Start Recording', then press keys in the browser.\nClick 'Stop Recording' when done.", font=('Arial', 10), foreground='blue')
+        info_label.pack(pady=10)
+        
+        # Recorded keys display
+        display_frame = ttk.Frame(keyboard_win, padding=10)
+        display_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        ttk.Label(display_frame, text="Captured Keys:", font=('Arial', 10, 'bold')).pack(anchor='w')
+        
+        keys_text = tk.Text(display_frame, height=10, width=60, font=('Courier', 10))
+        keys_text.pack(fill='both', expand=True, pady=5)
+        keys_text.config(state='disabled')
+        
+        # Step name
+        name_frame = ttk.Frame(keyboard_win, padding=10)
+        name_frame.pack(fill='x', padx=10)
+        
+        ttk.Label(name_frame, text="Step Name:").pack(side='left', padx=5)
+        name_var = tk.StringVar(value="Keyboard Navigation")
+        name_entry = ttk.Entry(name_frame, textvariable=name_var, width=40)
+        name_entry.pack(side='left', padx=5)
+        
+        # Tracking state
+        recorded_keys = []
+        recording = False
+        
+        def update_display():
+            keys_text.config(state='normal')
+            keys_text.delete('1.0', 'end')
+            for i, action in enumerate(recorded_keys, 1):
+                if isinstance(action, dict):
+                    if action.get('type') == 'keyboard':
+                        keys_text.insert('end', f"{i}. KEYBOARD: {action.get('key')}\n")
+                    elif action.get('type') == 'click':
+                        keys_text.insert('end', f"{i}. CLICK: {action.get('selector', 'unknown')[:40]}\n")
+                else:
+                    # Old format compatibility
+                    keys_text.insert('end', f"{i}. {action}\n")
+            keys_text.config(state='disabled')
+        
+        def record_keyboard():
+            """Capture keyboard, clicks, and scroll from browser using JavaScript."""
+            nonlocal recording
+            
+            # Inject JavaScript to capture all interactions
+            capture_script = """
+            window.capturedActions = [];
+            
+            // Keyboard listener - NO preventDefault so keys work normally
+            window.keyListener = function(e) {
+                let keyName = e.key;
+                
+                // Map special keys
+                if (keyName === 'Tab') keyName = 'TAB';
+                else if (keyName === 'Enter') keyName = 'ENTER';
+                else if (keyName === ' ') keyName = 'SPACE';
+                else if (keyName === 'ArrowDown') keyName = 'ARROW_DOWN';
+                else if (keyName === 'ArrowUp') keyName = 'ARROW_UP';
+                else if (keyName === 'ArrowLeft') keyName = 'ARROW_LEFT';
+                else if (keyName === 'ArrowRight') keyName = 'ARROW_RIGHT';
+                else if (keyName === 'Escape') keyName = 'ESCAPE';
+                else if (keyName === 'Backspace') keyName = 'BACKSPACE';
+                else if (keyName === 'Delete') keyName = 'DELETE';
+                
+                window.capturedActions.push({type: 'keyboard', key: keyName});
+                // NO preventDefault - let keys work naturally!
+            };
+            
+            // Click listener - capture element and position
+            window.clickListener = function(e) {
+                // Get CSS selector for clicked element
+                function getSelector(el) {
+                    if (el.id) return '#' + el.id;
+                    let path = [];
+                    while (el && el.nodeType === Node.ELEMENT_NODE) {
+                        let selector = el.nodeName.toLowerCase();
+                        if (el.className) {
+                            let classes = el.className.trim().split(/\\s+/);
+                            if (classes[0]) selector += '.' + classes[0];
+                        }
+                        path.unshift(selector);
+                        if (path.length >= 3) break;
+                        el = el.parentNode;
+                    }
+                    return path.join(' > ');
+                }
+                
+                let selector = getSelector(e.target);
+                window.capturedActions.push({
+                    type: 'click',
+                    selector: selector,
+                    x: e.clientX,
+                    y: e.clientY,
+                    scrollX: window.scrollX,
+                    scrollY: window.scrollY
+                });
+            };
+            
+            document.addEventListener('keydown', window.keyListener);
+            document.addEventListener('click', window.clickListener, true);
+            """
+            
+            try:
+                self.driver.execute_script(capture_script)
+                recording = True
+                info_label.config(text="🔴 RECORDING - Interact with browser (keys work normally), then click Stop", foreground='red')
+                start_btn.config(state='disabled')
+                stop_btn.config(state='normal')
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start recording: {e}")
+        
+        def stop_recording():
+            """Stop capturing and retrieve all actions."""
+            nonlocal recording, recorded_keys
+            
+            try:
+                # Retrieve captured actions from browser
+                captured = self.driver.execute_script("return window.capturedActions || [];")
+                
+                # Remove event listeners
+                self.driver.execute_script("""
+                if (window.keyListener) {
+                    document.removeEventListener('keydown', window.keyListener);
+                    delete window.keyListener;
+                }
+                if (window.clickListener) {
+                    document.removeEventListener('click', window.clickListener, true);
+                    delete window.clickListener;
+                }
+                delete window.capturedActions;
+                """)
+                
+                recorded_keys = captured
+                recording = False
+                
+                update_display()
+                
+                # Count actions
+                keyboard_count = sum(1 for a in captured if isinstance(a, dict) and a.get('type') == 'keyboard')
+                click_count = sum(1 for a in captured if isinstance(a, dict) and a.get('type') == 'click')
+                
+                info_label.config(text=f"✓ Captured {keyboard_count} keys + {click_count} clicks", foreground='green')
+                start_btn.config(state='normal')
+                stop_btn.config(state='disabled')
+                save_btn.config(state='normal')
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to stop recording: {e}")
+        
+        def save_actions():
+            """Save recorded keyboard and click actions to workflow."""
+            if not recorded_keys:
+                messagebox.showwarning("No Actions", "No actions were recorded.")
+                return
+            
+            step_name = name_var.get().strip() or "Interactive Navigation"
+            
+            # Create new action with all captured interactions
+            new_step = {
+                'action': 'interactive_sequence',
+                'actions': recorded_keys,  # List of keyboard and click actions
+                'step_name': step_name,
+            }
+            
+            # Insert after current step
+            insert_position = self.current_step + 1
+            self.config['actions'].insert(insert_position, new_step)
+            
+            keyboard_count = sum(1 for a in recorded_keys if isinstance(a, dict) and a.get('type') == 'keyboard')
+            click_count = sum(1 for a in recorded_keys if isinstance(a, dict) and a.get('type') == 'click')
+            
+            self.log(f"Added interactive sequence: {keyboard_count} keys + {click_count} clicks at position {insert_position + 1}")
+            self.save_verification_progress()
+            
+            keyboard_win.destroy()
+            messagebox.showinfo("Success", f"Interactive sequence saved!\n{keyboard_count} keystrokes + {click_count} clicks\n\nContinue verification to see it.")
+            self.current_step = insert_position
+            self.show_step()
+        
+        # Control buttons
+        btn_frame = ttk.Frame(keyboard_win)
+        btn_frame.pack(pady=10)
+        
+        start_btn = ttk.Button(btn_frame, text="🔴 Start Recording", command=record_keyboard)
+        start_btn.pack(side='left', padx=5)
+        
+        stop_btn = ttk.Button(btn_frame, text="⏹ Stop Recording", command=stop_recording, state='disabled')
+        stop_btn.pack(side='left', padx=5)
+        
+        save_btn = ttk.Button(btn_frame, text="💾 Save Actions", command=save_actions, state='disabled')
+        save_btn.pack(side='left', padx=5)
+        
+        ttk.Button(btn_frame, text="Cancel", command=keyboard_win.destroy).pack(side='left', padx=5)
+        
+        keyboard_win.transient(self.window)
+        keyboard_win.grab_set()
+    
+    def insert_step(self):
+        """Insert a new step after the current step."""
+        # Create dialog for step insertion
+        insert_win = tk.Toplevel(self.window)
+        insert_win.title("Insert New Step")
+        insert_win.geometry("500x300")
+        
+        ttk.Label(insert_win, text="Insert New Step After Current", font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        # Step type selection
+        type_frame = ttk.Frame(insert_win, padding=10)
+        type_frame.pack(fill='x', padx=10, pady=5)
+        
+        ttk.Label(type_frame, text="Step Type:").grid(row=0, column=0, sticky='w', pady=5)
+        step_type_var = tk.StringVar(value='click')
+        type_combo = ttk.Combobox(type_frame, textvariable=step_type_var, values=['click', 'input', 'select', 'navigate'], state='readonly', width=20)
+        type_combo.grid(row=0, column=1, pady=5, padx=5)
+        
+        # Step name
+        ttk.Label(type_frame, text="Step Name:").grid(row=1, column=0, sticky='w', pady=5)
+        name_var = tk.StringVar()
+        name_entry = ttk.Entry(type_frame, textvariable=name_var, width=30)
+        name_entry.grid(row=1, column=1, pady=5, padx=5)
+        
+        # Instructions
+        info_label = ttk.Label(
+            insert_win,
+            text="After inserting, use 'Override Element' to capture the element.\n"
+                 "You can also set values and mappings as needed.",
+            foreground='gray',
+            justify='left'
+        )
+        info_label.pack(pady=10, padx=10)
+        
+        def on_insert():
+            step_type = step_type_var.get()
+            step_name = name_var.get().strip()
+            
+            if not step_name:
+                messagebox.showwarning("Name Required", "Please enter a name for the new step.")
+                return
+            
+            # Create new step
+            new_step = {
+                'action': step_type,
+                'step_name': step_name,
+                'by': 'CSS_SELECTOR',
+                'selector': 'div:nth-of-type(1)',  # Placeholder - user will override
+            }
+            
+            if step_type in ('input', 'select'):
+                new_step['value'] = ''
+                new_step['field_context'] = {'id': step_name}
+            elif step_type == 'navigate':
+                new_step['url'] = self.driver.current_url if self.driver else ''
+            
+            # Insert after current step
+            insert_position = self.current_step + 1
+            self.config['actions'].insert(insert_position, new_step)
+            
+            self.log(f"Inserted new {step_type.upper()} step '{step_name}' at position {insert_position + 1}")
+            
+            # Save progress
+            self.save_verification_progress()
+            
+            # Move to the new step
+            self.current_step = insert_position
+            self.show_step()
+            
+            insert_win.destroy()
+        
+        btn_frame = ttk.Frame(insert_win)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Insert Step", command=on_insert).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=insert_win.destroy).pack(side='left', padx=5)
+        
+        insert_win.transient(self.window)
+        insert_win.grab_set()
     
     def restore_deleted(self):
         """Show list of deleted steps and allow restoration."""
@@ -1426,11 +1896,265 @@ class VerificationDialog:
         restore_win.transient(self.window)
         restore_win.grab_set()
     
+    def convert_to_click(self):
+        """Convert current SELECT action to CLICK for custom dropdowns."""
+        action = self.config['actions'][self.current_step]
+        
+        if action.get('action') != 'select':
+            messagebox.showinfo("Not a Select", "This action is not a SELECT. Only SELECT actions can be converted to CLICK.")
+            return
+        
+        response = messagebox.askyesno(
+            "Convert to Click",
+            "Convert this SELECT action to a CLICK action?\n\n"
+            "This is useful for custom dropdowns that aren't native <select> elements.\n\n"
+            "After converting, you can use Override Element to capture the actual clickable dropdown option."
+        )
+        
+        if response:
+            # Convert to click action
+            action['action'] = 'click'
+            action['original_action'] = 'select'  # Keep track
+            self.config['actions'][self.current_step] = action
+            
+            self.log("Converted SELECT to CLICK action. Use Override Element to capture the correct element.")
+            
+            # Refresh display
+            self.show_step()
+    
     def log(self, msg):
         """Log message to status label and main output."""
         self.status_label.config(text=msg)
         if self.main_log:
             self.main_log(f"[VERIFY] {msg}")
+    
+    def find_dropdown(self):
+        """Scan page for dropdown elements and let user select one."""
+        try:
+            # Scan page for all select elements
+            script = """
+            (function() {
+                var selects = document.querySelectorAll('select');
+                var results = [];
+                
+                selects.forEach(function(sel, index) {
+                    // Generate selector (matching override_element logic)
+                    function cssPath(el) {
+                        // Never return html or body elements
+                        if (!el || el.nodeName === 'HTML' || el.nodeName === 'BODY') {
+                            return null;
+                        }
+                        
+                        if (el.id && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(el.id)) {
+                            return '#' + el.id;
+                        }
+                        
+                        var path = [];
+                        var maxDepth = 5;
+                        var current = el;
+                        
+                        while (current && current.nodeType === Node.ELEMENT_NODE && path.length < maxDepth) {
+                            var selector = current.nodeName.toLowerCase();
+                            
+                            // Stop at html/body, don't include them
+                            if (selector === 'html' || selector === 'body') {
+                                break;
+                            }
+                            
+                            // Add class if present (first class only, if valid)
+                            if (current.className && typeof current.className === 'string') {
+                                var classes = current.className.trim().split(/\\s+/);
+                                if (classes.length > 0 && /^[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(classes[0])) {
+                                    selector += '.' + classes[0];
+                                }
+                            }
+                            
+                            // Add nth-of-type for specificity
+                            var sib = current;
+                            var nth = 1;
+                            while (sib = sib.previousElementSibling) {
+                                if (sib.nodeName.toLowerCase() === current.nodeName.toLowerCase()) nth++;
+                            }
+                            if (nth > 1 || !current.className) {
+                                selector += ':nth-of-type(' + nth + ')';
+                            }
+                            
+                            path.unshift(selector);
+                            current = current.parentNode;
+                        }
+                        
+                        return path.join(' > ');
+                    }
+                    
+                    // Get options
+                    var options = [];
+                    for (var i = 0; i < sel.options.length; i++) {
+                        options.push(sel.options[i].text.trim());
+                    }
+                    
+                    results.push({
+                        index: index,
+                        id: sel.id || '(no id)',
+                        name: sel.name || '(no name)',
+                        selector: cssPath(sel),
+                        optionsCount: options.length,
+                        options: options,
+                        label: sel.labels && sel.labels.length > 0 ? sel.labels[0].textContent.trim() : '(no label)'
+                    });
+                });
+                
+                return results;
+            })();
+            """
+            
+            dropdowns = self.driver.execute_script(script)
+            
+            if not dropdowns:
+                messagebox.showinfo("No Dropdowns Found", "No <select> dropdown elements were found on the current page.")
+                return
+            
+            self.log(f"Found {len(dropdowns)} dropdown(s) on page")
+            
+            # Show selection dialog
+            self.show_dropdown_selector(dropdowns)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to find dropdowns: {e}")
+            self.log(f"Error finding dropdowns: {e}")
+    
+    def show_dropdown_selector(self, dropdowns):
+        """Show dialog to select which dropdown to use."""
+        select_win = tk.Toplevel(self.window)
+        select_win.title("Select Dropdown")
+        select_win.geometry("800x500")
+        
+        ttk.Label(select_win, text=f"Found {len(dropdowns)} Dropdown(s) - Select One", font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        # Scrollable list
+        list_frame = ttk.Frame(select_win)
+        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        canvas = tk.Canvas(list_frame)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        selected_dropdown = {'value': None}
+        
+        for dd in dropdowns:
+            dd_frame = ttk.Frame(scrollable_frame, relief='solid', borderwidth=1, padding=10)
+            dd_frame.pack(fill='x', padx=5, pady=5)
+            
+            # Info
+            info_text = f"Dropdown #{dd['index'] + 1}\n"
+            info_text += f"Label: {dd['label']}\n"
+            info_text += f"ID: {dd['id']} | Name: {dd['name']}\n"
+            info_text += f"Options: {dd['optionsCount']} items\n"
+            info_text += f"Selector: {dd['selector'][:60]}..."
+            
+            ttk.Label(dd_frame, text=info_text, font=('Courier', 9)).pack(anchor='w')
+            
+            # Preview options
+            preview = ", ".join(dd['options'][:5])
+            if len(dd['options']) > 5:
+                preview += f" ... (+{len(dd['options']) - 5} more)"
+            ttk.Label(dd_frame, text=f"Preview: {preview}", foreground='gray').pack(anchor='w', pady=(5, 0))
+            
+            # Select button
+            def make_select(dropdown):
+                def select():
+                    selected_dropdown['value'] = dropdown
+                    select_win.destroy()
+                return select
+            
+            ttk.Button(dd_frame, text="Use This Dropdown", command=make_select(dd)).pack(anchor='e', pady=(5, 0))
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        ttk.Button(select_win, text="Cancel", command=select_win.destroy).pack(pady=10)
+        
+        select_win.transient(self.window)
+        select_win.grab_set()
+        select_win.wait_window()
+        
+        # If user selected a dropdown, show options picker
+        if selected_dropdown['value']:
+            self.show_dropdown_options(selected_dropdown['value'])
+    
+    def show_dropdown_options(self, dropdown):
+        """Show dialog to select value from dropdown options."""
+        options_win = tk.Toplevel(self.window)
+        options_win.title("Select Option")
+        options_win.geometry("600x400")
+        
+        ttk.Label(options_win, text=f"Select Option from: {dropdown['label']}", font=('Arial', 12, 'bold')).pack(pady=10)
+        ttk.Label(options_win, text=f"Selector: {dropdown['selector']}", font=('Courier', 9), foreground='gray').pack(pady=5)
+        
+        # Options list
+        list_frame = ttk.Frame(options_win)
+        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        canvas = tk.Canvas(list_frame)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        selected_option = {'value': None}
+        
+        for opt in dropdown['options']:
+            if not opt.strip():
+                continue
+            
+            opt_frame = ttk.Frame(scrollable_frame, relief='solid', borderwidth=1, padding=5)
+            opt_frame.pack(fill='x', padx=5, pady=2)
+            
+            ttk.Label(opt_frame, text=opt, font=('Arial', 10)).pack(side='left', padx=5)
+            
+            def make_select_option(option):
+                def select():
+                    selected_option['value'] = option
+                    options_win.destroy()
+                return select
+            
+            ttk.Button(opt_frame, text="Select", command=make_select_option(opt)).pack(side='right', padx=5)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        ttk.Button(options_win, text="Cancel", command=options_win.destroy).pack(pady=10)
+        
+        options_win.transient(self.window)
+        options_win.grab_set()
+        options_win.wait_window()
+        
+        # If user selected an option, update the action
+        if selected_option['value']:
+            action = self.config['actions'][self.current_step]
+            action['action'] = 'select'
+            action['selector'] = dropdown['selector']
+            action['by'] = 'CSS_SELECTOR'
+            self.override_var.set(selected_option['value'])  # Set the selected value
+            
+            self.element_status.config(text=f"Dropdown configured: {dropdown['label']}", foreground='green')
+            self.log(f"Configured dropdown: {dropdown['selector'][:60]} with value: {selected_option['value']}")
+            
+            # Refresh display
+            self.show_step()
     
     def override_element(self):
         """Allow user to click on page to select a new element for this step."""
@@ -1454,27 +2178,24 @@ class VerificationDialog:
                 window._elementOverride = null;
                 
                 function cssPath(el) {
-                    if (!(el instanceof Element)) return '';
+                    // Never return html or body elements
+                    if (!el || el.nodeName === 'HTML' || el.nodeName === 'BODY') {
+                        return null;
+                    }
                     
-                    // Try to build a simple, reliable selector
-                    // Priority: ID > class > tag with nth-of-type
-                    
-                    // If element has ID, use it directly
                     if (el.id && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(el.id)) {
                         return '#' + el.id;
                     }
                     
-                    // Try to build a short path
                     var path = [];
+                    var maxDepth = 5;
                     var current = el;
                     
-                    while (current && current.nodeType === Node.ELEMENT_NODE && path.length < 5) {
+                    while (current && current.nodeType === Node.ELEMENT_NODE && path.length < maxDepth) {
                         var selector = current.nodeName.toLowerCase();
                         
-                        // Check for ID on parent
-                        if (current.id && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(current.id)) {
-                            selector += '#' + current.id;
-                            path.unshift(selector);
+                        // Stop at html/body, don't include them
+                        if (selector === 'html' || selector === 'body') {
                             break;
                         }
                         
@@ -1511,17 +2232,58 @@ class VerificationDialog:
                     
                     var target = e.target;
                     
-                    // If it's a link or button, explicitly prevent default action
-                    if (target.tagName === 'A' || target.tagName === 'BUTTON') {
+                    console.log('Click captured on:', target.tagName, target.className, target.id);
+                    
+                    // For SELECT elements, prevent dropdown from opening
+                    if (target.tagName === 'SELECT') {
+                        console.log('SELECT element clicked - capturing without opening dropdown');
+                        // Force close if it tried to open
+                        setTimeout(function() { target.blur(); }, 0);
+                    }
+                    
+                    // For clicks on OPTION elements inside SELECT, use the SELECT instead
+                    if (target.tagName === 'OPTION' && target.parentElement && target.parentElement.tagName === 'SELECT') {
+                        target = target.parentElement;
+                        console.log('Redirected from OPTION to SELECT:', target);
+                    }
+                    
+                    // Only reject if truly clicking on html/body with no children at click point
+                    if ((target.tagName === 'HTML' || target.tagName === 'BODY') && 
+                        (!e.clientX || !e.clientY)) {
+                        console.log('Rejected: clicked on page background');
+                        alert('Please click on a specific element, not the page background.');
+                        return false;
+                    }
+                    
+                    // For BODY clicks with coordinates, try to find the actual element at that point
+                    if (target.tagName === 'BODY' && e.clientX && e.clientY) {
+                        var elementAtPoint = document.elementFromPoint(e.clientX, e.clientY);
+                        if (elementAtPoint && elementAtPoint.tagName !== 'BODY' && elementAtPoint.tagName !== 'HTML') {
+                            target = elementAtPoint;
+                            console.log('Refined target to:', target.tagName, target.className, target.id);
+                        }
+                    }
+                    
+                    // If it's a link, button, or select, explicitly prevent default action
+                    if (target.tagName === 'A' || target.tagName === 'BUTTON' || target.tagName === 'SELECT') {
                         e.preventDefault();
                     }
+                    
+                    var cssPathResult = cssPath(target);
+                    if (!cssPathResult) {
+                        console.log('Could not generate selector for:', target);
+                        alert('Could not generate selector for this element. Try clicking a more specific element.');
+                        return false;
+                    }
+                    
+                    console.log('Captured element with selector:', cssPathResult);
                     
                     window._elementOverride = {
                         tag: target.tagName.toLowerCase(),
                         id: target.id || null,
                         name: target.name || null,
                         type: target.type || null,
-                        cssPath: cssPath(target),
+                        cssPath: cssPathResult,
                         text: target.textContent.substring(0, 50)
                     };
                     
@@ -1587,7 +2349,7 @@ class VerificationDialog:
                             }
                             
                             if (current.className && typeof current.className === 'string') {
-                                var classes = current.className.trim().split(/\s+/);
+                                var classes = current.className.trim().split(/\\s+/);
                                 if (classes.length > 0 && /^[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(classes[0])) {
                                     selector += '.' + classes[0];
                                 }
@@ -1617,17 +2379,57 @@ class VerificationDialog:
                         
                         var target = e.target;
                         
-                        // If it's a link or button, explicitly prevent default action
-                        if (target.tagName === 'A' || target.tagName === 'BUTTON') {
+                        console.log('Click captured on:', target.tagName, target.className, target.id);
+                        
+                        // For SELECT elements, prevent dropdown from opening
+                        if (target.tagName === 'SELECT') {
+                            console.log('SELECT element clicked - capturing without opening dropdown');
+                            setTimeout(function() { target.blur(); }, 0);
+                        }
+                        
+                        // For clicks on OPTION elements inside SELECT, use the SELECT instead
+                        if (target.tagName === 'OPTION' && target.parentElement && target.parentElement.tagName === 'SELECT') {
+                            target = target.parentElement;
+                            console.log('Redirected from OPTION to SELECT:', target);
+                        }
+                        
+                        // Only reject if truly clicking on html/body with no children at click point
+                        if ((target.tagName === 'HTML' || target.tagName === 'BODY') && 
+                            (!e.clientX || !e.clientY)) {
+                            console.log('Rejected: clicked on page background');
+                            alert('Please click on a specific element, not the page background.');
+                            return false;
+                        }
+                        
+                        // For BODY clicks with coordinates, try to find the actual element at that point
+                        if (target.tagName === 'BODY' && e.clientX && e.clientY) {
+                            var elementAtPoint = document.elementFromPoint(e.clientX, e.clientY);
+                            if (elementAtPoint && elementAtPoint.tagName !== 'BODY' && elementAtPoint.tagName !== 'HTML') {
+                                target = elementAtPoint;
+                                console.log('Refined target to:', target.tagName, target.className, target.id);
+                            }
+                        }
+                        
+                        // If it's a link, button, or select, explicitly prevent default action
+                        if (target.tagName === 'A' || target.tagName === 'BUTTON' || target.tagName === 'SELECT') {
                             e.preventDefault();
                         }
+                        
+                        var cssPathResult = cssPath(target);
+                        if (!cssPathResult) {
+                            console.log('Could not generate selector for:', target);
+                            alert('Could not generate selector for this element. Try clicking a more specific element.');
+                            return false;
+                        }
+                        
+                        console.log('Captured element with selector:', cssPathResult);
                         
                         window._elementOverride = {
                             tag: target.tagName.toLowerCase(),
                             id: target.id || null,
                             name: target.name || null,
                             type: target.type || null,
-                            cssPath: cssPath(target),
+                            cssPath: cssPathResult,
                             text: target.textContent.substring(0, 50)
                         };
                         
@@ -1653,47 +2455,404 @@ class VerificationDialog:
             result = self.driver.execute_script("return window._elementOverride;")
             
             if result:
-                # User clicked an element!
-                css_path = result.get('cssPath', '')
-                element_tag = result.get('tag', 'unknown')
-                element_id = result.get('id', '')
-                element_text = result.get('text', '')[:30]
+                # User clicked an element! Now show hierarchy navigator
+                self.log("Element captured. Opening hierarchy navigator...")
+                self.element_status.config(text="Opening hierarchy navigator...", foreground='blue')
                 
-                # Update current action's selector
-                action = self.config['actions'][self.current_step]
-                action['by'] = 'CSS_SELECTOR'
-                action['selector'] = css_path
+                # Open hierarchy navigator dialog
+                final_selector = self.show_hierarchy_navigator(result.get('cssPath', ''))
                 
-                # Update field context
-                if 'field_context' not in action:
-                    action['field_context'] = {}
-                action['field_context']['id'] = element_id
-                action['field_context']['tag'] = element_tag
-                
-                self.element_status.config(text=f" Element updated: {element_tag}#{element_id if element_id else 'no-id'}")
-                self.log(f"Element overridden! New selector: {css_path[:80]}...")
-                
-                # Re-highlight the new element
-                self.preview_element(action)
-                
-                # Clear the capture
-                self.driver.execute_script("window._elementOverride = null;")
-            else:
-                # Keep polling
-                self.window.after(100, self._check_element_override)
+                if final_selector:
+                    # Update current action's selector
+                    action = self.config['actions'][self.current_step]
+                    action['selector'] = final_selector
+                    action['by'] = 'CSS_SELECTOR'
+                    self.config['actions'][self.current_step] = action
+                    
+                    self.element_status.config(text=f"Element overridden! New selector: {final_selector[:80]}...", foreground='green')
+                    self.log(f"Element overridden! New selector: {final_selector[:80]}...")
+                    
+                    # Refresh display
+                    self.show_step()
+                else:
+                    self.element_status.config(text="Element override cancelled", foreground='gray')
+                    self.log("Element override cancelled")
+                return
+            
+            # Continue polling
+            self.window.after(100, self._check_element_override)
+            
         except Exception as e:
-            self.element_status.config(text="Polling stopped")
-            print(f"Element override polling error: {e}")
+            self.element_status.config(text="Polling error", foreground='red')
+            self.log(f"Element override error: {e}")
+    
+    def show_hierarchy_navigator(self, initial_selector):
+        """Show dialog to navigate DOM hierarchy and select exact element."""
+        nav_win = tk.Toplevel(self.window)
+        nav_win.title("DOM Hierarchy Navigator")
+        nav_win.geometry("700x400")
+        
+        ttk.Label(nav_win, text="Navigate DOM Hierarchy", font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        # Current selector state
+        current_selector = {'value': initial_selector}
+        
+        # Element info display
+        info_frame = ttk.LabelFrame(nav_win, text="Current Element", padding=10)
+        info_frame.pack(fill='x', padx=10, pady=5)
+        
+        tag_label = ttk.Label(info_frame, text="Tag: ", font=('Courier', 10))
+        tag_label.pack(anchor='w')
+        
+        id_label = ttk.Label(info_frame, text="ID: ", font=('Courier', 10))
+        id_label.pack(anchor='w')
+        
+        classes_label = ttk.Label(info_frame, text="Classes: ", font=('Courier', 10))
+        classes_label.pack(anchor='w')
+        
+        selector_label = ttk.Label(info_frame, text="Selector: ", font=('Courier', 9), wraplength=650)
+        selector_label.pack(anchor='w', pady=5)
+        
+        # Navigation buttons
+        nav_button_frame = ttk.Frame(nav_win)
+        nav_button_frame.pack(pady=10)
+        
+        def update_display():
+            """Update element info display and highlight."""
+            try:
+                # Get element info from browser
+                script = f"""
+                (function() {{
+                    try {{
+                        var el = document.querySelector('{current_selector['value']}');
+                        if (!el) return null;
+                        
+                        return {{
+                            tag: el.tagName.toLowerCase(),
+                            id: el.id || '(none)',
+                            classes: el.className || '(none)',
+                            selector: '{current_selector['value']}',
+                            hasParent: el.parentElement && el.parentElement.tagName !== 'HTML'
+                        }};
+                    }} catch(e) {{
+                        return null;
+                    }}
+                }})();
+                """
+                
+                info = self.driver.execute_script(script)
+                
+                if info:
+                    tag_label.config(text=f"Tag: {info['tag']}")
+                    id_label.config(text=f"ID: {info['id']}")
+                    classes_label.config(text=f"Classes: {info['classes']}")
+                    selector_label.config(text=f"Selector: {info['selector']}")
+                    
+                    # Highlight element
+                    highlight_script = f"""
+                    (function() {{
+                        // Remove old highlights
+                        var oldHighlights = document.querySelectorAll('[data-hierarchy-highlight]');
+                        oldHighlights.forEach(function(el) {{
+                            el.style.border = '';
+                            el.style.backgroundColor = '';
+                            el.style.outline = '';
+                            el.removeAttribute('data-hierarchy-highlight');
+                        }});
+                        
+                        // Add new highlight
+                        var el = document.querySelector('{current_selector['value']}');
+                        if (el) {{
+                            el.style.border = '3px solid blue';
+                            el.style.backgroundColor = 'rgba(0,0,255,0.1)';
+                            el.style.outline = '2px dashed cyan';
+                            el.setAttribute('data-hierarchy-highlight', 'true');
+                            el.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+                        }}
+                    }})();
+                    """
+                    self.driver.execute_script(highlight_script)
+            except Exception as e:
+                tag_label.config(text=f"Error: {str(e)[:50]}")
+        
+        def move_up():
+            """Move to parent element."""
+            try:
+                script = f"""
+                (function() {{
+                    var el = document.querySelector('{current_selector['value']}');
+                    if (!el || !el.parentElement || el.parentElement.tagName === 'HTML') return null;
+                    
+                    var parent = el.parentElement;
+                    
+                    // Generate selector for parent
+                    function cssPath(el) {{
+                        if (el.id && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(el.id)) {{
+                            return '#' + el.id;
+                        }}
+                        
+                        var path = [];
+                        var current = el;
+                        var maxDepth = 5;
+                        
+                        while (current && current.nodeType === Node.ELEMENT_NODE && path.length < maxDepth) {{
+                            var selector = current.nodeName.toLowerCase();
+                            
+                            if (selector === 'html' || selector === 'body') {{
+                                break;
+                            }}
+                            
+                            if (current.className && typeof current.className === 'string') {{
+                                var classes = current.className.trim().split(/\\s+/);
+                                if (classes.length > 0 && /^[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(classes[0])) {{
+                                    selector += '.' + classes[0];
+                                }}
+                            }}
+                            
+                            var siblings = current.parentNode ? Array.from(current.parentNode.children) : [];
+                            var sameTagSiblings = siblings.filter(function(s) {{ return s.nodeName === current.nodeName; }});
+                            if (sameTagSiblings.length > 1) {{
+                                var index = sameTagSiblings.indexOf(current) + 1;
+                                selector += ':nth-of-type(' + index + ')';
+                            }}
+                            
+                            path.unshift(selector);
+                            current = current.parentNode;
+                        }}
+                        
+                        return path.join(' > ');
+                    }}
+                    
+                    return cssPath(parent);
+                }})();
+                """
+                
+                parent_selector = self.driver.execute_script(script)
+                if parent_selector:
+                    current_selector['value'] = parent_selector
+                    update_display()
+            except Exception as e:
+                print(f"Move up error: {e}")
+        
+        def move_down():
+            """Move to first child element."""
+            try:
+                script = f"""
+                (function() {{
+                    var el = document.querySelector('{current_selector['value']}');
+                    if (!el || !el.children || el.children.length === 0) return null;
+                    
+                    var child = el.children[0];
+                    
+                    function cssPath(el) {{
+                        if (el.id && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(el.id)) {{
+                            return '#' + el.id;
+                        }}
+                        
+                        var path = [];
+                        var current = el;
+                        var maxDepth = 5;
+                        
+                        while (current && current.nodeType === Node.ELEMENT_NODE && path.length < maxDepth) {{
+                            var selector = current.nodeName.toLowerCase();
+                            
+                            if (selector === 'html' || selector === 'body') {{
+                                break;
+                            }}
+                            
+                            if (current.className && typeof current.className === 'string') {{
+                                var classes = current.className.trim().split(/\\s+/);
+                                if (classes.length > 0 && /^[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(classes[0])) {{
+                                    selector += '.' + classes[0];
+                                }}
+                            }}
+                            
+                            var siblings = current.parentNode ? Array.from(current.parentNode.children) : [];
+                            var sameTagSiblings = siblings.filter(function(s) {{ return s.nodeName === current.nodeName; }});
+                            if (sameTagSiblings.length > 1) {{
+                                var index = sameTagSiblings.indexOf(current) + 1;
+                                selector += ':nth-of-type(' + index + ')';
+                            }}
+                            
+                            path.unshift(selector);
+                            current = current.parentNode;
+                        }}
+                        
+                        return path.join(' > ');
+                    }}
+                    
+                    return cssPath(child);
+                }})();
+                """
+                
+                child_selector = self.driver.execute_script(script)
+                if child_selector:
+                    current_selector['value'] = child_selector
+                    update_display()
+            except Exception as e:
+                print(f"Move down error: {e}")
+        
+        ttk.Button(nav_button_frame, text="↑ Up (Parent)", command=move_up, width=15).pack(side='left', padx=5)
+        ttk.Button(nav_button_frame, text="↓ Down (First Child)", command=move_down, width=15).pack(side='left', padx=5)
+        
+        # Instructions
+        ttk.Label(nav_win, text="Use ↑ Up to select parent element, ↓ Down to select first child.\nClick 'Use This Element' when ready.", foreground='gray').pack(pady=5)
+        
+        # Confirm/Cancel buttons
+        final_selector = {'value': None}
+        
+        def confirm():
+            final_selector['value'] = current_selector['value']
+            # Remove highlight
+            try:
+                self.driver.execute_script("""
+                var oldHighlights = document.querySelectorAll('[data-hierarchy-highlight]');
+                oldHighlights.forEach(function(el) {
+                    el.style.border = '';
+                    el.style.backgroundColor = '';
+                    el.style.outline = '';
+                    el.removeAttribute('data-hierarchy-highlight');
+                });
+                """)
+            except:
+                pass
+            nav_win.destroy()
+        
+        def cancel():
+            # Remove highlight
+            try:
+                self.driver.execute_script("""
+                var oldHighlights = document.querySelectorAll('[data-hierarchy-highlight]');
+                oldHighlights.forEach(function(el) {
+                    el.style.border = '';
+                    el.style.backgroundColor = '';
+                    el.style.outline = '';
+                    el.removeAttribute('data-hierarchy-highlight');
+                });
+                """)
+            except:
+                pass
+            nav_win.destroy()
+        
+        btn_frame = ttk.Frame(nav_win)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="✓ Use This Element", command=confirm).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=cancel).pack(side='left', padx=5)
+        
+        # Initial display
+        update_display()
+        
+        nav_win.transient(self.window)
+        nav_win.grab_set()
+        nav_win.wait_window()
+        
+        return final_selector['value']
     
     def execute_action(self, action):
         """Execute a single action in the browser."""
         action_type = action.get('action')
-        by = getattr(By, action.get('by', 'CSS_SELECTOR').upper())
+        by = getattr(By, action.get('by', 'CSS_SELECTOR').upper()) if action.get('by') else By.CSS_SELECTOR
         selector = action.get('selector')
         
         if action_type == 'navigate':
             self.driver.get(action.get('url'))
             time.sleep(1)
+        elif action_type == 'keyboard':
+            # Execute keyboard action
+            from selenium.webdriver.common.keys import Keys
+            
+            # Map key names to Selenium Keys
+            key_map = {
+                'TAB': Keys.TAB,
+                'ENTER': Keys.ENTER,
+                'SPACE': Keys.SPACE,
+                'ARROW_DOWN': Keys.ARROW_DOWN,
+                'ARROW_UP': Keys.ARROW_UP,
+                'ARROW_LEFT': Keys.ARROW_LEFT,
+                'ARROW_RIGHT': Keys.ARROW_RIGHT,
+                'ESCAPE': Keys.ESCAPE,
+                'BACKSPACE': Keys.BACKSPACE,
+                'DELETE': Keys.DELETE,
+            }
+            
+            # Check if new format (keys array) or old format (single key + repeat)
+            if 'keys' in action:
+                # New format: list of keys to press in sequence
+                keys_sequence = action.get('keys', [])
+                try:
+                    active_element = self.driver.switch_to.active_element
+                    for key_name in keys_sequence:
+                        selenium_key = key_map.get(key_name, Keys.TAB)
+                        active_element.send_keys(selenium_key)
+                        time.sleep(0.3)
+                except Exception as e:
+                    # Fallback: send to body
+                    body = self.driver.find_element(By.TAG_NAME, 'body')
+                    for key_name in keys_sequence:
+                        selenium_key = key_map.get(key_name, Keys.TAB)
+                        body.send_keys(selenium_key)
+                        time.sleep(0.3)
+            else:
+                # Old format: single key with repeat count
+                key_name = action.get('key', 'TAB')
+                repeat = action.get('repeat', 1)
+                selenium_key = key_map.get(key_name, Keys.TAB)
+                
+                try:
+                    active_element = self.driver.switch_to.active_element
+                    for _ in range(repeat):
+                        active_element.send_keys(selenium_key)
+                        time.sleep(0.3)
+                except Exception as e:
+                    # Fallback: send to body
+                    body = self.driver.find_element(By.TAG_NAME, 'body')
+                    for _ in range(repeat):
+                        body.send_keys(selenium_key)
+                        time.sleep(0.3)
+            
+            time.sleep(0.5)  # Wait for page to respond
+        elif action_type == 'interactive_sequence':
+            # Execute sequence of keyboard + click actions
+            from selenium.webdriver.common.keys import Keys
+            
+            key_map = {
+                'TAB': Keys.TAB, 'ENTER': Keys.ENTER, 'SPACE': Keys.SPACE,
+                'ARROW_DOWN': Keys.ARROW_DOWN, 'ARROW_UP': Keys.ARROW_UP,
+                'ARROW_LEFT': Keys.ARROW_LEFT, 'ARROW_RIGHT': Keys.ARROW_RIGHT,
+                'ESCAPE': Keys.ESCAPE, 'BACKSPACE': Keys.BACKSPACE, 'DELETE': Keys.DELETE,
+            }
+            
+            actions_list = action.get('actions', [])
+            for act in actions_list:
+                if isinstance(act, dict):
+                    if act.get('type') == 'keyboard':
+                        key_name = act.get('key')
+                        selenium_key = key_map.get(key_name, Keys.TAB)
+                        try:
+                            active_element = self.driver.switch_to.active_element
+                            active_element.send_keys(selenium_key)
+                        except:
+                            body = self.driver.find_element(By.TAG_NAME, 'body')
+                            body.send_keys(selenium_key)
+                        time.sleep(0.3)
+                    elif act.get('type') == 'click':
+                        selector = act.get('selector')
+                        if selector:
+                            try:
+                                # Scroll to position if provided
+                                scroll_y = act.get('scrollY', 0)
+                                if scroll_y:
+                                    self.driver.execute_script(f"window.scrollTo(0, {scroll_y});")
+                                    time.sleep(0.2)
+                                
+                                el = WebDriverWait(self.driver, 5).until(
+                                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                                )
+                                el.click()
+                                time.sleep(0.5)
+                            except Exception as e:
+                                self.log(f"Click failed on {selector}: {e}")
+            time.sleep(0.5)
         elif action_type == 'click':
             # Find element
             el = WebDriverWait(self.driver, 10).until(
@@ -1784,15 +2943,24 @@ class VerificationDialog:
     def save_verification_progress(self):
         """Save verified actions and deleted steps to prevent data loss."""
         try:
-            verified_config = self.config.copy()
-            verified_config['actions'] = self.verified_actions
-            verified_config['deleted_steps'] = self.deleted_steps  # Save deleted steps too
-            verified_config['verification_complete'] = False
-            
+            # IMPORTANT: Reload current config to preserve any CSV mapping changes
             site_name = self.config.get('site_name', 'workflow')
+            config_file = f'configs/{site_name}_workflow.json'
+            
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as f:
+                    current_config = json.load(f)
+            else:
+                current_config = self.config.copy()
+            
+            # Update ONLY the actions and deleted steps, preserve everything else
+            current_config['actions'] = self.verified_actions
+            current_config['deleted_steps'] = self.deleted_steps
+            current_config['verification_complete'] = False
+            
             filename = f'configs/{site_name}_verified_partial.json'
             with open(filename, 'w') as f:
-                json.dump(verified_config, f, indent=2)
+                json.dump(current_config, f, indent=2)
         except Exception as e:
             print(f"Warning: Failed to save verification progress: {e}")
     
@@ -1818,9 +2986,17 @@ class VerificationDialog:
         
         # Save final verified workflow with all corrections
         try:
-            # Use the corrected config (which has been updated during approve_step)
-            verified_config = self.config.copy()
-            # Override actions with verified actions (which include corrections)
+            # IMPORTANT: Reload current config to preserve any CSV mapping changes
+            site_name = self.config.get('site_name', 'workflow')
+            filename = f'configs/{site_name}_workflow.json'
+            
+            if os.path.exists(filename):
+                with open(filename, 'r') as f:
+                    verified_config = json.load(f)
+            else:
+                verified_config = self.config.copy()
+            
+            # Update ONLY verified actions, preserve CSV mappings and other metadata
             verified_config['actions'] = self.verified_actions
             verified_config['verification_complete'] = True
             
@@ -1829,8 +3005,6 @@ class VerificationDialog:
                 verified_config['deleted_steps_archive'] = self.deleted_steps
                 self.log(f"Saved {len(self.deleted_steps)} deleted steps to archive")
             
-            site_name = self.config.get('site_name', 'workflow')
-            filename = f'configs/{site_name}_workflow.json'
             with open(filename, 'w') as f:
                 json.dump(verified_config, f, indent=2)
             
@@ -1855,6 +3029,31 @@ class VerificationDialog:
     def on_close(self):
         """Clean up and close."""
         self.log(f"Verification cancelled at step {self.current_step + 1}. {len(self.verified_actions)} steps were verified.")
+        
+        # Save progress even if cancelled (for automation to use)
+        if self.verified_actions:
+            try:
+                site_name = self.config.get('site_name', 'workflow')
+                filename = f'configs/{site_name}_workflow.json'
+                
+                # IMPORTANT: Reload current config to preserve CSV mappings
+                if os.path.exists(filename):
+                    with open(filename, 'r') as f:
+                        verified_config = json.load(f)
+                else:
+                    verified_config = self.config.copy()
+                
+                # Update ONLY verified actions, preserve CSV mappings and other metadata
+                verified_config['actions'] = self.verified_actions
+                verified_config['deleted_steps'] = self.deleted_steps
+                verified_config['verification_complete'] = False  # Mark as incomplete
+                
+                with open(filename, 'w') as f:
+                    json.dump(verified_config, f, indent=2)
+                self.log(f"Saved {len(self.verified_actions)} verified steps for automation use.")
+            except Exception as e:
+                self.log(f"Warning: Failed to save progress: {e}")
+        
         if self.driver:
             try:
                 self.driver.quit()
@@ -1905,6 +3104,246 @@ def save_prefs(data: dict):
 # Replay Automation
 # -------------------------
 
+def replay_workflow_single_row(driver, config, row, log_callback=None, row_idx=0, session_iteration=1):
+    """Replay workflow for a single row with an already-initialized driver.
+    
+    Args:
+        session_iteration: Which iteration in THIS browser session (1=first, 2=second, etc)
+    """
+    csv_row_dict = row.to_dict()
+    
+    # US State name to abbreviation mapping
+    STATE_MAPPING = {
+        'alabama': 'AL', 'alaska': 'AK', 'arizona': 'AZ', 'arkansas': 'AR', 'california': 'CA',
+        'colorado': 'CO', 'connecticut': 'CT', 'delaware': 'DE', 'florida': 'FL', 'georgia': 'GA',
+        'hawaii': 'HI', 'idaho': 'ID', 'illinois': 'IL', 'indiana': 'IN', 'iowa': 'IA',
+        'kansas': 'KS', 'kentucky': 'KY', 'louisiana': 'LA', 'maine': 'ME', 'maryland': 'MD',
+        'massachusetts': 'MA', 'michigan': 'MI', 'minnesota': 'MN', 'mississippi': 'MS', 'missouri': 'MO',
+        'montana': 'MT', 'nebraska': 'NE', 'nevada': 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
+        'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', 'ohio': 'OH',
+        'oklahoma': 'OK', 'oregon': 'OR', 'pennsylvania': 'PA', 'rhode island': 'RI', 'south carolina': 'SC',
+        'south dakota': 'SD', 'tennessee': 'TN', 'texas': 'TX', 'utah': 'UT', 'vermont': 'VT',
+        'virginia': 'VA', 'washington': 'WA', 'west virginia': 'WV', 'wisconsin': 'WI', 'wyoming': 'WY'
+    }
+    
+    # Determine which steps to execute
+    loop_start = config.get('loop_start_step', 0)
+    actions_to_execute = config['actions']
+    start_idx = 0
+    
+    if session_iteration > 1 and loop_start > 0:
+        # On 2nd+ iterations IN THIS SESSION, start from loop point
+        start_idx = loop_start
+        actions_to_execute = config['actions'][loop_start:]
+        if log_callback:
+            log_callback(f"Starting from step {loop_start + 1} (skipping login/setup steps)")
+    
+    for step_idx, action in enumerate(actions_to_execute, start=start_idx):
+        try:
+            action_type = action.get('action')
+            step_name = action.get('step_name', '')
+            
+            # Log step
+            step_desc = step_name if step_name else f"{action_type.upper() if action_type else 'Unknown'} action"
+            if log_callback:
+                log_callback(f"Step {step_idx + 1}: {step_desc}")
+            
+            if action_type == 'interactive_sequence':
+                # Handle interactive sequence (keyboard + clicks)
+                from selenium.webdriver.common.keys import Keys
+                
+                key_map = {
+                    'TAB': Keys.TAB, 'ENTER': Keys.ENTER, 'SPACE': Keys.SPACE,
+                    'ARROW_DOWN': Keys.ARROW_DOWN, 'ARROW_UP': Keys.ARROW_UP,
+                    'ARROW_LEFT': Keys.ARROW_LEFT, 'ARROW_RIGHT': Keys.ARROW_RIGHT,
+                    'ESCAPE': Keys.ESCAPE, 'BACKSPACE': Keys.BACKSPACE, 'DELETE': Keys.DELETE,
+                }
+                
+                actions_list = action.get('actions', [])
+                for act in actions_list:
+                    if isinstance(act, dict):
+                        if act.get('type') == 'keyboard':
+                            key_name = act.get('key')
+                            selenium_key = key_map.get(key_name, Keys.TAB)
+                            try:
+                                active_element = driver.switch_to.active_element
+                                active_element.send_keys(selenium_key)
+                            except:
+                                body = driver.find_element(By.TAG_NAME, 'body')
+                                body.send_keys(selenium_key)
+                            time.sleep(0.3)
+                        elif act.get('type') == 'click':
+                            selector = act.get('selector')
+                            if selector:
+                                try:
+                                    scroll_y = act.get('scrollY', 0)
+                                    if scroll_y:
+                                        driver.execute_script(f"window.scrollTo(0, {scroll_y});")
+                                        time.sleep(0.2)
+                                    
+                                    el = WebDriverWait(driver, 5).until(
+                                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                                    )
+                                    el.click()
+                                    time.sleep(0.5)
+                                except Exception as e:
+                                    if log_callback:
+                                        log_callback(f"Click failed: {e}")
+                time.sleep(0.5)
+                continue
+            
+            if action_type == 'keyboard':
+                # Handle keyboard actions
+                from selenium.webdriver.common.keys import Keys
+                
+                key_map = {
+                    'TAB': Keys.TAB,
+                    'ENTER': Keys.ENTER,
+                    'SPACE': Keys.SPACE,
+                    'ARROW_DOWN': Keys.ARROW_DOWN,
+                    'ARROW_UP': Keys.ARROW_UP,
+                    'ARROW_LEFT': Keys.ARROW_LEFT,
+                    'ARROW_RIGHT': Keys.ARROW_RIGHT,
+                    'ESCAPE': Keys.ESCAPE,
+                    'BACKSPACE': Keys.BACKSPACE,
+                    'DELETE': Keys.DELETE,
+                }
+                
+                # Check if new format (keys array) or old format (single key + repeat)
+                if 'keys' in action:
+                    # New format: list of keys recorded from browser
+                    keys_sequence = action.get('keys', [])
+                    active_element = driver.switch_to.active_element
+                    for key_name in keys_sequence:
+                        selenium_key = key_map.get(key_name, Keys.TAB)
+                        active_element.send_keys(selenium_key)
+                        time.sleep(0.3)
+                else:
+                    # Old format: single key with repeat count
+                    key_name = action.get('key', 'TAB')
+                    repeat = action.get('repeat', 1)
+                    selenium_key = key_map.get(key_name, Keys.TAB)
+                    active_element = driver.switch_to.active_element
+                    for _ in range(repeat):
+                        active_element.send_keys(selenium_key)
+                        time.sleep(0.3)
+                
+                time.sleep(0.5)
+                continue
+            
+            by = getattr(By, action.get('by', 'CSS_SELECTOR').upper())
+            selector = action.get('selector')
+            if not selector and action_type != 'navigate':
+                continue
+            
+            if action_type == 'navigate':
+                nav_url = action.get('url')
+                if nav_url:
+                    driver.get(nav_url)
+                    time.sleep(1)
+                continue
+            
+            if action_type == 'click':
+                el = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((by, selector))
+                )
+                time.sleep(0.5)
+                
+                # Click with stale element retry (same as verify workflow)
+                try:
+                    el.click()
+                except Exception as e:
+                    if 'stale' in str(e).lower():
+                        if log_callback:
+                            log_callback("Element became stale, re-finding...")
+                        el = WebDriverWait(driver, 5).until(
+                            EC.element_to_be_clickable((by, selector))
+                        )
+                        el.click()
+                    else:
+                        raise
+                
+                time.sleep(0.5)
+                
+            elif action_type == 'input':
+                el = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((by, selector))
+                )
+                csv_col = config['csv_mapping'].get(selector)
+                value = None
+                
+                if csv_col == '__RECORDED__':
+                    value = str(action.get('value', ''))
+                elif csv_col and csv_col in row:
+                    # Handle blank/NaN values properly
+                    raw_value = row[csv_col]
+                    if pd.isna(raw_value):
+                        value = ''
+                    else:
+                        value = str(raw_value)
+                        # Convert state names to abbreviations
+                        field_id = action.get('field_context', {}).get('id', '').lower()
+                        if 'state' in field_id or 'state' in csv_col.lower():
+                            state_abbr = STATE_MAPPING.get(value.lower().strip())
+                            if state_abbr:
+                                value = state_abbr
+                else:
+                    field_context = action.get('field_context', {})
+                    llm_value = infer_field_value_with_llm(field_context, csv_row_dict)
+                    if llm_value:
+                        value = llm_value
+                    else:
+                        value = str(action.get('value', ''))
+                
+                if value is not None:
+                    el.clear()
+                    if value:  # Only send keys if value is not empty
+                        el.send_keys(value)
+                time.sleep(0.5)
+                    
+            elif action_type == 'select':
+                from selenium.webdriver.support.ui import Select
+                el = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((by, selector))
+                )
+                select_el = Select(el)
+                csv_col = config['csv_mapping'].get(selector)
+                value = None
+                
+                available_options = [opt.text for opt in select_el.options if opt.text.strip()]
+                
+                if csv_col == '__RECORDED__':
+                    value = str(action.get('value', ''))
+                elif csv_col and csv_col in row:
+                    # Handle blank/NaN values properly
+                    raw_value = row[csv_col]
+                    if pd.isna(raw_value):
+                        value = ''
+                    else:
+                        value = str(raw_value)
+                        # Convert state names to abbreviations
+                        field_id = action.get('field_context', {}).get('id', '').lower()
+                        if 'state' in field_id or 'state' in csv_col.lower():
+                            state_abbr = STATE_MAPPING.get(value.lower().strip())
+                            if state_abbr:
+                                value = state_abbr
+                else:
+                    field_context = action.get('field_context', {})
+                    llm_value = infer_field_value_with_llm(field_context, csv_row_dict, available_options=available_options)
+                    if llm_value:
+                        value = llm_value
+                    else:
+                        value = str(action.get('value', ''))
+                
+                if value is not None and value != '':
+                    select_el.select_by_visible_text(value)
+                time.sleep(0.5)
+                
+        except Exception as e:
+            if log_callback:
+                log_callback(f"Error on step {step_idx + 1}: {e}")
+            raise
+
 def replay_workflow(config_file, csv_file, headless=False):
     with open(config_file) as f:
         config = json.load(f)
@@ -1930,14 +3369,8 @@ def replay_workflow(config_file, csv_file, headless=False):
         print(f"\nProcessing row {idx + 1}/{len(df)}...")
         csv_row_dict = row.to_dict()
         
-        # Determine which steps to execute
-        loop_start = config.get('loop_start_step', 0)
+        # Execute all steps for every row
         actions_to_execute = config['actions']
-        
-        if idx > 0 and loop_start > 0:
-            # On 2nd+ iterations, start from loop point
-            actions_to_execute = config['actions'][loop_start:]
-            print(f"  Starting from step {loop_start + 1} (skipping login/setup steps)")
         
         for action in actions_to_execute:
             try:
@@ -2127,9 +3560,12 @@ class LeadAutomationApp:
         ttk.Button(frm_buttons, text="Map CSV", command=self.on_map_csv).grid(row=0, column=1, padx=5, pady=5)
         ttk.Button(frm_buttons, text="Save Config", command=self.on_save_config).grid(row=0, column=2, padx=5, pady=5)
         ttk.Button(frm_buttons, text="LLM Settings", command=self.on_llm_settings).grid(row=0, column=3, padx=5, pady=5)
-        ttk.Button(frm_buttons, text="Edit Workflow", command=self.on_edit_workflow).grid(row=0, column=4, padx=5, pady=5)
-        ttk.Button(frm_buttons, text="Verify Workflow", command=self.on_verify_workflow).grid(row=0, column=5, padx=5, pady=5)
-        ttk.Button(frm_buttons, text="Run Workflow", command=self.on_run_workflow_browser).grid(row=0, column=6, padx=5, pady=5)
+        ttk.Button(frm_buttons, text="Load Workflow", command=self.on_load_workflow).grid(row=0, column=4, padx=5, pady=5)
+        ttk.Button(frm_buttons, text="Edit Workflow", command=self.on_edit_workflow).grid(row=0, column=5, padx=5, pady=5)
+        ttk.Button(frm_buttons, text="Verify Workflow", command=self.on_verify_workflow).grid(row=0, column=6, padx=5, pady=5)
+        ttk.Button(frm_buttons, text="Run Partial", command=self.on_run_partial).grid(row=0, column=7, padx=5, pady=5)
+        ttk.Button(frm_buttons, text="Run Workflow", command=self.on_run_workflow_browser).grid(row=0, column=8, padx=5, pady=5)
+        ttk.Button(frm_buttons, text="View Status", command=self.on_view_status).grid(row=0, column=9, padx=5, pady=5)
 
         # Output box
         frm_output = ttk.Frame(root, padding=(10,0,10,10))
@@ -2413,14 +3849,43 @@ class LeadAutomationApp:
                         try:
                             with open(config_file, 'r') as f:
                                 config = json.load(f)
+                            
+                            # Update CSV mapping
                             config['csv_mapping'] = self.csv_mapping
+                            
+                            # CRITICAL: Update actions from memory if we have a fresh recording
+                            # This prevents verification-corrupted configs from losing steps
+                            config_actions_count = len(config.get('actions', []))
+                            memory_actions_count = len(self.actions_log) if self.actions_log else 0
+                            
+                            if memory_actions_count > 0:
+                                # We have actions in memory - use them (they're fresher)
+                                self.log(f"Updating config with {memory_actions_count} recorded steps (config had {config_actions_count})")
+                                config['actions'] = self.actions_log
+                                config['verification_complete'] = False  # Need to re-verify
+                            else:
+                                self.log(f"Preserving config's {config_actions_count} existing steps (no new recording in memory)")
+                            
                             with open(config_file, 'w') as f:
                                 json.dump(config, f, indent=2)
-                            self.log(f"\n✓ Mapping saved to {config_file}")
+                            self.log(f"\n✓ Mapping and workflow saved to {config_file}")
                         except Exception as e:
                             self.log(f"Warning: Could not update config file: {e}")
                     else:
-                        self.log("\nMapping saved to session. Click 'Save Config' to create workflow file.")
+                        # Create new config file
+                        self.log("No config file exists yet. Creating new one...")
+                        self.on_save_config()
+                        # Then update with mapping
+                        if os.path.exists(config_file):
+                            try:
+                                with open(config_file, 'r') as f:
+                                    config = json.load(f)
+                                config['csv_mapping'] = self.csv_mapping
+                                with open(config_file, 'w') as f:
+                                    json.dump(config, f, indent=2)
+                                self.log(f"\n✓ Mapping saved to new config file")
+                            except:
+                                pass
                 else:
                     self.log("\nMapping saved to session. Enter Site Name and click 'Save Config' to persist.")
             else:
@@ -2543,6 +4008,105 @@ class LeadAutomationApp:
         except Exception as e:
             self.log(f"Error saving config: {e}")
 
+    def on_load_workflow(self):
+        """Load and display current workflow configuration."""
+        site_name = self.ent_site_name.get().strip()
+        
+        if not site_name:
+            messagebox.showwarning("Missing Site Name", "Please enter a Site Name.")
+            return
+        
+        config_file = f'configs/{site_name}_workflow.json'
+        if not os.path.exists(config_file):
+            messagebox.showwarning("No Workflow", f"No workflow found for '{site_name}'.\n\nPlease create a workflow first.")
+            return
+        
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+            
+            # Create info dialog
+            info_win = tk.Toplevel(self.root)
+            info_win.title(f"Workflow Info: {site_name}")
+            info_win.geometry("700x600")
+            
+            ttk.Label(info_win, text=f"📋 Workflow Configuration", font=('Arial', 14, 'bold')).pack(pady=10)
+            
+            # Info frame
+            info_frame = ttk.Frame(info_win, padding=10)
+            info_frame.pack(fill='both', expand=True, padx=10, pady=5)
+            
+            info_text = tk.Text(info_frame, width=80, height=30, font=('Courier', 9))
+            info_text.pack(fill='both', expand=True)
+            
+            # Build info display
+            info_text.insert('end', f"Site Name: {config.get('site_name', 'N/A')}\n", 'bold')
+            info_text.insert('end', f"URL: {config.get('url', 'N/A')}\n\n", 'bold')
+            
+            info_text.insert('end', f"Config File: {config_file}\n", 'gray')
+            info_text.insert('end', f"Last Modified: {time.ctime(os.path.getmtime(config_file))}\n\n", 'gray')
+            
+            # Verification status
+            verified = config.get('verification_complete', False)
+            status_text = "✓ VERIFIED" if verified else "⚠ NOT VERIFIED"
+            status_color = 'green' if verified else 'orange'
+            info_text.insert('end', f"Status: {status_text}\n\n", status_color)
+            
+            # Steps count
+            actions = config.get('actions', [])
+            info_text.insert('end', f"Total Steps: {len(actions)}\n", 'bold')
+            
+            # Deleted steps
+            deleted = config.get('deleted_steps', [])
+            if deleted:
+                info_text.insert('end', f"Deleted Steps (excluded): {len(deleted)}\n", 'orange')
+            
+            info_text.insert('end', "\n" + "="*60 + "\n\n")
+            
+            # CSV Mappings
+            csv_mapping = config.get('csv_mapping', {})
+            if csv_mapping:
+                info_text.insert('end', "CSV COLUMN MAPPINGS:\n", 'bold')
+                info_text.insert('end', "-" * 60 + "\n")
+                for step_idx, col_name in csv_mapping.items():
+                    step_name = "Unknown"
+                    if int(step_idx) < len(actions):
+                        step_name = actions[int(step_idx)].get('step_name', f"Step {int(step_idx)+1}")
+                    info_text.insert('end', f"  [{step_idx}] {step_name}\n")
+                    info_text.insert('end', f"      → CSV Column: {col_name}\n", 'blue')
+                info_text.insert('end', "\n")
+            else:
+                info_text.insert('end', "No CSV mappings configured.\n\n", 'gray')
+            
+            # Action summary
+            info_text.insert('end', "WORKFLOW STEPS:\n", 'bold')
+            info_text.insert('end', "-" * 60 + "\n")
+            for i, action in enumerate(actions[:20], 1):  # Show first 20
+                action_type = action.get('action', 'unknown').upper()
+                step_name = action.get('step_name', f'Step {i}')
+                info_text.insert('end', f"  {i}. [{action_type}] {step_name}\n")
+            
+            if len(actions) > 20:
+                info_text.insert('end', f"\n  ... and {len(actions)-20} more steps\n", 'gray')
+            
+            # Configure tags
+            info_text.tag_config('bold', font=('Courier', 9, 'bold'))
+            info_text.tag_config('gray', foreground='gray')
+            info_text.tag_config('green', foreground='green', font=('Courier', 9, 'bold'))
+            info_text.tag_config('orange', foreground='orange', font=('Courier', 9, 'bold'))
+            info_text.tag_config('blue', foreground='blue')
+            info_text.config(state='disabled')
+            
+            # Close button
+            ttk.Button(info_win, text="Close", command=info_win.destroy).pack(pady=10)
+            
+            info_win.transient(self.root)
+            self.log(f"Loaded workflow info for '{site_name}' - {len(actions)} steps, {len(csv_mapping)} mappings")
+            
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Failed to load workflow: {e}")
+            self.log(f"Error loading workflow: {e}")
+    
     def on_edit_workflow(self):
         """Open workflow editor to modify CSV mappings and settings."""
         site_name = self.ent_site_name.get().strip()
@@ -2611,6 +4175,29 @@ class LeadAutomationApp:
             with open(config_file, 'r') as f:
                 config = json.load(f)
             
+            # Diagnostic: Show what we're loading
+            actions_count = len(config.get('actions', []))
+            self.log(f"Loading workflow config: {actions_count} steps found in {config_file}")
+            
+            # Check if memory has more steps than config
+            memory_count = len(self.actions_log) if self.actions_log else 0
+            if memory_count > actions_count:
+                self.log(f"⚠ WARNING: Memory has {memory_count} steps but config only has {actions_count}!")
+                self.log(f"💡 Click 'Map CSV' again to update the config with your latest recording.")
+                response = messagebox.askyesno(
+                    "Outdated Config Detected",
+                    f"Config file has {actions_count} steps\n"
+                    f"Memory has {memory_count} steps from your recording\n\n"
+                    f"Update config with your latest recording before verifying?"
+                )
+                if response:
+                    config['actions'] = self.actions_log
+                    config['verification_complete'] = False
+                    with open(config_file, 'w') as f:
+                        json.dump(config, f, indent=2)
+                    self.log(f"✓ Updated config with {memory_count} steps from memory")
+                    actions_count = memory_count
+            
             self.log("Starting workflow verification...")
             self.log("A browser will open to test each step with the first CSV row.")
             self.log("Review each action and approve or correct as needed.\n")
@@ -2648,6 +4235,400 @@ class LeadAutomationApp:
         except Exception as e:
             self.log(f"Error running workflow: {e}")
 
+    def on_run_partial(self):
+        """Run workflow for a specific number of rows."""
+        site_name = self.ent_site_name.get().strip()
+        csv_file = self.ent_csv.get().strip()
+        
+        if not site_name or not csv_file:
+            messagebox.showwarning("Missing Info", "Please provide site name and CSV file.")
+            return
+        
+        if not os.path.exists(csv_file):
+            messagebox.showerror("File Not Found", f"CSV file not found: {csv_file}")
+            return
+        
+        # Load CSV to count rows
+        try:
+            df = pd.read_csv(csv_file)
+            total_rows = len(df)
+        except Exception as e:
+            messagebox.showerror("CSV Error", f"Failed to read CSV: {e}")
+            return
+        
+        # Load processing status
+        status = load_processing_status(site_name)
+        completed_count = len([k for k, v in status.items() if v.get('status') == 'completed'])
+        
+        # Show dialog to select number of rows
+        partial_win = tk.Toplevel(self.root)
+        partial_win.title("Run Partial Workflow")
+        partial_win.geometry("450x250")
+        
+        # Status info
+        info_frame = ttk.Frame(partial_win, padding=10)
+        info_frame.pack(fill='x')
+        ttk.Label(info_frame, text=f"Total Rows: {total_rows}", font=('Arial', 10)).pack(anchor='w')
+        ttk.Label(info_frame, text=f"Already Completed: {completed_count}", font=('Arial', 10), foreground='green').pack(anchor='w')
+        ttk.Label(info_frame, text=f"Remaining: {total_rows - completed_count}", font=('Arial', 10), foreground='blue').pack(anchor='w')
+        
+        # Row count selection
+        select_frame = ttk.Frame(partial_win, padding=10)
+        select_frame.pack(fill='x', padx=10, pady=10)
+        
+        ttk.Label(select_frame, text="Number of rows to process:").grid(row=0, column=0, sticky='w', pady=5)
+        row_count_var = tk.StringVar(value='5')
+        row_spinbox = ttk.Spinbox(select_frame, from_=1, to=total_rows, textvariable=row_count_var, width=10)
+        row_spinbox.grid(row=0, column=1, pady=5, padx=5)
+        
+        # Headless mode option
+        headless_var = tk.BooleanVar(value=False)
+        headless_check = ttk.Checkbutton(
+            partial_win, 
+            text="⚡ Run browser invisibly (faster, with detailed logs)",
+            variable=headless_var
+        )
+        headless_check.pack(pady=10)
+        
+        # Quick select buttons
+        quick_frame = ttk.Frame(select_frame)
+        quick_frame.grid(row=1, column=0, columnspan=2, pady=5)
+        
+        ttk.Button(quick_frame, text="3", command=lambda: row_count_var.set('3'), width=5).pack(side='left', padx=2)
+        ttk.Button(quick_frame, text="5", command=lambda: row_count_var.set('5'), width=5).pack(side='left', padx=2)
+        ttk.Button(quick_frame, text="7", command=lambda: row_count_var.set('7'), width=5).pack(side='left', padx=2)
+        ttk.Button(quick_frame, text="10", command=lambda: row_count_var.set('10'), width=5).pack(side='left', padx=2)
+        
+        ttk.Label(partial_win, text="This will process unprocessed rows only.\nAlready completed rows will be skipped.", foreground='gray').pack(pady=10)
+        
+        def start_partial():
+            try:
+                count = int(row_count_var.get())
+                headless = headless_var.get()
+                partial_win.destroy()
+                self.run_partial_workflow(count, headless=headless)
+            except ValueError:
+                messagebox.showerror("Invalid Input", "Please enter a valid number.")
+        
+        btn_frame = ttk.Frame(partial_win)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Start Processing", command=start_partial).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=partial_win.destroy).pack(side='left', padx=5)
+        
+        partial_win.transient(self.root)
+        partial_win.grab_set()
+    
+    def run_partial_workflow(self, row_count, headless=False):
+        """Run workflow for specified number of unprocessed rows."""
+        if headless:
+            self.log("Running in headless mode (browser invisible)...")
+        site_name = self.ent_site_name.get().strip()
+        csv_file = self.ent_csv.get().strip()
+        
+        self.log(f"Starting partial workflow processing ({row_count} rows)...")
+        
+        # Load workflow config
+        config_path = os.path.join('configs', f'{site_name}_workflow.json')
+        
+        if not os.path.exists(config_path):
+            messagebox.showerror("Config Not Found", f"No workflow config found: {config_path}")
+            return
+        
+        self.log("Loading workflow configuration...")
+        
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Filter out deleted steps if present in config
+            if 'deleted_steps' in config:
+                deleted_steps = config.get('deleted_steps', [])
+                self.log(f"Found {len(deleted_steps)} deleted steps in config - these will be excluded")
+                # Deleted steps are already excluded from 'actions' array during verification
+            
+            # Validate actions - remove any with missing selectors (except allowed types)
+            original_count = len(config.get('actions', []))
+            valid_actions = []
+            for action in config.get('actions', []):
+                action_type = action.get('action')
+                selector = action.get('selector')
+                
+                # These action types don't need selectors
+                if action_type in ('navigate', 'keyboard', 'interactive_sequence'):
+                    valid_actions.append(action)
+                # These need selectors
+                elif selector and selector.strip():
+                    valid_actions.append(action)
+                else:
+                    step_name = action.get('step_name', 'unnamed')
+                    self.log(f"⚠ Skipping invalid step '{step_name}' - missing selector")
+            
+            config['actions'] = valid_actions
+            
+            if len(valid_actions) < original_count:
+                self.log(f"Filtered {original_count - len(valid_actions)} invalid steps. Running with {len(valid_actions)} valid steps.")
+            
+        except Exception as e:
+            messagebox.showerror("Config Error", f"Failed to load config: {e}")
+            return
+        
+        # Load CSV
+        try:
+            df = pd.read_csv(csv_file)
+        except Exception as e:
+            messagebox.showerror("CSV Error", f"Failed to read CSV: {e}")
+            return
+        
+        # Load processing status
+        status = load_processing_status(site_name)
+        
+        # Find unprocessed rows
+        unprocessed_indices = []
+        for idx in range(len(df)):
+            if str(idx) not in status or status[str(idx)].get('status') != 'completed':
+                unprocessed_indices.append(idx)
+        
+        if not unprocessed_indices:
+            messagebox.showinfo("All Done", "All rows have already been processed!")
+            return
+        
+        # Limit to requested count
+        rows_to_process = unprocessed_indices[:row_count]
+        
+        self.log(f"Found {len(unprocessed_indices)} unprocessed rows. Processing first {len(rows_to_process)}...")
+        
+        # Run workflow with status tracking
+        threading.Thread(target=self._run_partial_thread, args=(config, df, rows_to_process, site_name, headless), daemon=True).start()
+    
+    def _run_partial_thread(self, config, df, row_indices, site_name, headless=False):
+        """Thread to run partial workflow with status tracking."""
+        # Create progress window
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("Workflow Progress")
+        progress_win.geometry("600x400")
+        
+        ttk.Label(progress_win, text="Workflow Execution Progress", font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        # Progress info
+        info_frame = ttk.Frame(progress_win, padding=10)
+        info_frame.pack(fill='x', padx=10)
+        
+        current_row_label = ttk.Label(info_frame, text="Current Row: -", font=('Arial', 10, 'bold'))
+        current_row_label.pack(anchor='w')
+        
+        current_step_label = ttk.Label(info_frame, text="Current Step: -", font=('Arial', 10))
+        current_step_label.pack(anchor='w')
+        
+        progress_label = ttk.Label(info_frame, text="Progress: 0/0 rows", font=('Arial', 10))
+        progress_label.pack(anchor='w')
+        
+        remaining_label = ttk.Label(info_frame, text="Remaining: 0 rows", font=('Arial', 10), foreground='blue')
+        remaining_label.pack(anchor='w')
+        
+        # Progress bar
+        progress_bar = ttk.Progressbar(progress_win, mode='determinate', length=500)
+        progress_bar.pack(pady=10, padx=10)
+        
+        # Status log
+        log_frame = ttk.Frame(progress_win)
+        log_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        status_text = tk.Text(log_frame, height=15, width=70)
+        status_text.pack(fill='both', expand=True)
+        status_scrollbar = ttk.Scrollbar(log_frame, command=status_text.yview)
+        status_scrollbar.pack(side='right', fill='y')
+        status_text.config(yscrollcommand=status_scrollbar.set)
+        
+        def update_progress(row_num, step_info, completed, total):
+            current_row_label.config(text=f"Current Row: {row_num}")
+            current_step_label.config(text=f"Current Step: {step_info}")
+            progress_label.config(text=f"Progress: {completed}/{total} rows")
+            remaining_label.config(text=f"Remaining: {total - completed} rows")
+            progress_bar['value'] = (completed / total) * 100
+            progress_bar['maximum'] = 100
+        
+        def log_status(msg, color='black'):
+            status_text.insert('end', msg + '\n', color)
+            status_text.tag_config(color, foreground=color)
+            status_text.see('end')
+        
+        try:
+            driver = init_driver(headless=headless, parent=self.root)
+            status = load_processing_status(site_name)
+            
+            # Navigate to initial URL
+            initial_url = config.get('url')
+            if initial_url:
+                progress_win.after(0, lambda: log_status(f"Navigating to: {initial_url}", 'blue'))
+                self.log(f"Navigating to: {initial_url}")
+                driver.get(initial_url)
+                time.sleep(2)
+            
+            total_rows = len(row_indices)
+            
+            for i, row_idx in enumerate(row_indices, 1):
+                row = df.iloc[row_idx]
+                
+                # DIAGNOSTIC: Show what row we're actually processing
+                row_data_preview = {k: str(v)[:30] for k, v in list(row.to_dict().items())[:3]}
+                
+                # Update progress
+                progress_win.after(0, lambda r=row_idx: update_progress(r + 1, "Starting...", i - 1, total_rows))
+                progress_win.after(0, lambda r=row_idx, d=row_data_preview: log_status(f"\n=== Processing Row {r + 1} (Index: {r}) ===", 'blue'))
+                progress_win.after(0, lambda d=row_data_preview: log_status(f"    Data: {d}", 'gray'))
+                self.log(f"\n=== Processing Row {row_idx + 1} (CSV Index: {row_idx}) ===")
+                self.log(f"    Row data preview: {row_data_preview}")
+                
+                try:
+                    # Custom callback to update step info
+                    def step_callback(step_msg):
+                        progress_win.after(0, lambda r=row_idx, s=step_msg: update_progress(r + 1, s, i - 1, total_rows))
+                        progress_win.after(0, lambda m=step_msg: log_status(f"  {m}", 'black'))
+                        self.log(step_msg)
+                    
+                    # Pass session iteration (i=1 for first row, i=2 for second, etc)
+                    replay_workflow_single_row(driver, config, row, log_callback=step_callback, row_idx=row_idx, session_iteration=i)
+                    
+                    # Mark as completed
+                    status[str(row_idx)] = {
+                        'status': 'completed',
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'row_number': row_idx + 1
+                    }
+                    save_processing_status(site_name, status)
+                    
+                    progress_win.after(0, lambda r=row_idx: log_status(f"✓ Row {r + 1} completed successfully", 'green'))
+                    self.log(f"✓ Row {row_idx + 1} completed successfully")
+                    
+                except Exception as e:
+                    # Extract meaningful error message
+                    error_msg = str(e).split('\n')[0] if str(e) else "Unknown error"
+                    if not error_msg or error_msg == "Message: ":
+                        error_msg = "Element not found or browser error - check selectors in Verify Workflow"
+                    
+                    progress_win.after(0, lambda r=row_idx, err=error_msg: log_status(f"✗ Row {r + 1} failed: {err}", 'red'))
+                    progress_win.after(0, lambda: log_status(f"\n❌ STOPPING - First row failed. Fix workflow and try again.", 'red'))
+                    self.log(f"✗ Row {row_idx + 1} failed: {error_msg}")
+                    self.log(f"\n❌ STOPPING - Workflow has errors. Please verify workflow again.")
+                    
+                    status[str(row_idx)] = {
+                        'status': 'failed',
+                        'error': error_msg,
+                        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                        'row_number': row_idx + 1
+                    }
+                    save_processing_status(site_name, status)
+                    
+                    # STOP on first failure
+                    driver.quit()
+                    return
+            
+            # Final update
+            progress_win.after(0, lambda: update_progress("-", "Complete!", total_rows, total_rows))
+            progress_win.after(0, lambda: log_status(f"\n=== Processing Complete ===", 'green'))
+            progress_win.after(0, lambda: log_status(f"Processed {total_rows} rows", 'green'))
+            
+            self.log(f"\n=== Partial Processing Complete ===")
+            self.log(f"Processed {len(row_indices)} rows")
+            
+            driver.quit()
+            
+        except Exception as e:
+            progress_win.after(0, lambda err=e: log_status(f"Error: {err}", 'red'))
+            self.log(f"Error in partial workflow: {e}")
+    
+    def on_view_status(self):
+        """View processing status of all rows."""
+        site_name = self.ent_site_name.get().strip()
+        csv_file = self.ent_csv.get().strip()
+        
+        if not site_name:
+            messagebox.showwarning("Missing Info", "Please provide site name.")
+            return
+        
+        status = load_processing_status(site_name)
+        
+        if not status:
+            messagebox.showinfo("No Status", "No processing status found. Run partial workflow first.")
+            return
+        
+        # Show status dialog
+        status_win = tk.Toplevel(self.root)
+        status_win.title("Processing Status")
+        status_win.geometry("700x500")
+        
+        ttk.Label(status_win, text="Processing Status", font=('Arial', 12, 'bold')).pack(pady=10)
+        
+        # Summary
+        completed = len([k for k, v in status.items() if v.get('status') == 'completed'])
+        failed = len([k for k, v in status.items() if v.get('status') == 'failed'])
+        
+        summary_frame = ttk.Frame(status_win, padding=10)
+        summary_frame.pack(fill='x', padx=10)
+        
+        ttk.Label(summary_frame, text=f"Completed: {completed}", foreground='green', font=('Arial', 10, 'bold')).pack(side='left', padx=10)
+        ttk.Label(summary_frame, text=f"Failed: {failed}", foreground='red', font=('Arial', 10, 'bold')).pack(side='left', padx=10)
+        
+        # Status list
+        list_frame = ttk.Frame(status_win)
+        list_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        canvas = tk.Canvas(list_frame)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Sort by row number
+        sorted_status = sorted(status.items(), key=lambda x: int(x[0]))
+        
+        for row_idx, info in sorted_status:
+            status_val = info.get('status', 'unknown')
+            timestamp = info.get('timestamp', 'N/A')
+            row_num = info.get('row_number', int(row_idx) + 1)
+            
+            status_frame = ttk.Frame(scrollable_frame, relief='solid', borderwidth=1, padding=5)
+            status_frame.pack(fill='x', padx=5, pady=2)
+            
+            if status_val == 'completed':
+                status_text = f"✓ Row {row_num}: Completed"
+                color = 'green'
+            elif status_val == 'failed':
+                status_text = f"✗ Row {row_num}: Failed - {info.get('error', 'Unknown error')}"
+                color = 'red'
+            else:
+                status_text = f"Row {row_num}: {status_val}"
+                color = 'gray'
+            
+            ttk.Label(status_frame, text=status_text, foreground=color, font=('Arial', 9)).pack(side='left')
+            ttk.Label(status_frame, text=f"  |  {timestamp}", foreground='gray', font=('Arial', 8)).pack(side='left')
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Clear status button
+        def clear_status():
+            response = messagebox.askyesno("Clear Status", "Are you sure you want to clear all processing status? This cannot be undone.")
+            if response:
+                status_path = os.path.join('configs', f'{site_name}_processing_status.json')
+                if os.path.exists(status_path):
+                    os.remove(status_path)
+                messagebox.showinfo("Cleared", "Processing status has been cleared.")
+                status_win.destroy()
+        
+        btn_frame = ttk.Frame(status_win)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Clear All Status", command=clear_status).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Close", command=status_win.destroy).pack(side='left', padx=5)
+        
+        status_win.transient(self.root)
+    
     def on_run_workflow_browser(self):
         site_name = self.ent_site_name.get().strip()
         csv_file = self.ent_csv.get().strip()
