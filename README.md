@@ -1,6 +1,6 @@
 # leadbot
 
-**leadbot** is a cutting-edge HTML application that demonstrates advanced development skills through seamless integration with the OpenAI API. By using **leadbot**, developers can showcase their ability to harness external APIs to create innovative solutions, making it an essential asset for any portfolio. This project allows users to witness the power of API integration firsthand, highlighting their technical expertise and problem-solving capabilities. The tech stack includes HTML for the front-end and the OpenAI API for backend functionality.
+The **leadbot** application is an HTML project designed to showcase advanced development skills by integrating with the OpenAI API. It allows developers to demonstrate their ability to work with external APIs to create innovative solutions. The project is built with HTML and integrates with the OpenAI API for showcasing API integration skills.
 
 ![Language](https://img.shields.io/badge/language-HTML-blue)
 ![Status](https://img.shields.io/badge/status-Portfolio-Ready-green)
