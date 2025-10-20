@@ -67,7 +67,7 @@ leadbot/
 
 - **Language:** HTML
 - **Files:** 3
-- **Lines of Code:** 4,724
+- **Lines of Code:** 4,787
 - **Status:** Portfolio-Ready
 
 ## 🚧 Future Enhancements
